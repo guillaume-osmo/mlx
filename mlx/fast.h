@@ -202,6 +202,21 @@ MLX_API array turboquant_decode_attention_prod_model_batched(
     const array& value_rotation,
     StreamOrDevice s = {});
 
+/** Fused GRU cell (Metal RNN). One step: out = (1-z)*n + z*h_prev with r,z,n from gates. */
+MLX_API array gru_cell(
+    const array& input_proj,
+    const array& hidden_proj,
+    const array& hidden_prev,
+    StreamOrDevice s = {});
+
+/** Fused LSTM cell (Metal RNN). One step: cell_new = f*c_prev + i*g, hidden_new = o*tanh(cell_new). */
+MLX_API std::pair<array, array> lstm_cell(
+    const array& input_proj,
+    const array& hidden_proj,
+    const array& cell_prev,
+    const array& hidden_prev,
+    StreamOrDevice s = {});
+
 using TemplateArg = std::variant<int, bool, Dtype>;
 using ScalarArg = std::variant<bool, int, float>;
 

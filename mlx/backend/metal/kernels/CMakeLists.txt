@@ -57,6 +57,8 @@ build_kernel(scaled_dot_product_attention sdpa_vector.h)
 build_kernel(sdpa_vector_turboquant sdpa_vector_turboquant.h
              steel/attn/params_turboquant.h)
 build_kernel(turboquant_qk turboquant_qk.h)
+build_kernel(fast_gru_cell fast_gru_cell.h)
+build_kernel(fast_lstm_cell fast_lstm_cell.h)
 if(MLX_METAL_VERSION GREATER_EQUAL 320)
   build_kernel(fence)
 endif()
