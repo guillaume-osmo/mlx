@@ -272,8 +272,6 @@ void init_fast(nb::module_& parent_module) {
                can have at most 4 dimensions and must be broadcast-compatible with
                the shape ``[B, N, T_q, T_kv]``. If an additive mask is given its
                type must promote to the promoted type of ``q``, ``k``, and ``v``.
-               The ``"causal"`` mask uses lower-right alignment where the
-               last query aligns with the last key.
             sinks (array, optional): An optional array of attention sinks.
                Default: ``None``.
 
@@ -295,6 +293,66 @@ void init_fast(nb::module_& parent_module) {
             scale = D ** -0.5
             out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="causal")
       )pbdoc");
+
+  m.def(
+      "turboquant_qk_packed_scores",
+      &mx::fast::turboquant_qk_packed_scores,
+      "q_rot"_a,
+      "k_packed"_a,
+      "k_norms"_a,
+      "centroids"_a,
+      "bits"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_qk_packed_scores(q_rot: array, k_packed: array, k_norms: array, centroids: array, bits: int, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Fused TurboQuant decode+score kernel.
+
+        Computes ``scores = q_rot @ dequant(k_packed, k_norms, centroids).T`` without
+        materializing dequantized keys as a separate tensor.
+
+        Args:
+          q_rot (array): Query matrix with shape ``[n_queries, dim]``.
+          k_packed (array): Packed key indices with shape ``[n_keys, words_per_key]`` and dtype ``uint32``.
+          k_norms (array): Key norms with shape ``[n_keys]``.
+          centroids (array): Codebook values with shape ``[2**bits]``.
+          bits (int): Packed bits per key dimension (supported: ``2``, ``3``, ``4``).
+
+        Returns:
+          array: Score matrix with shape ``[n_queries, n_keys]`` and dtype ``float32``.
+      )pbdoc");
+
+  m.def(
+      "turboquant_qk_packed_scores_batched",
+      &mx::fast::turboquant_qk_packed_scores_batched,
+      "q_rot"_a,
+      "k_packed"_a,
+      "k_norms"_a,
+      "centroids"_a,
+      "bits"_a,
+      "n_repeats"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_qk_packed_scores_batched(q_rot: array, k_packed: array, k_norms: array, centroids: array, bits: int, n_repeats: int, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Batched fused TurboQuant decode+score kernel.
+
+        Computes scores for all query heads in one call without Python head loops.
+
+        Args:
+          q_rot (array): Rotated/scaled queries with shape ``[B, Hq, L, D]``.
+          k_packed (array): Packed key indices with shape ``[B, Hkv, T, W]`` and dtype ``uint32``.
+          k_norms (array): Key norms with shape ``[B, Hkv, T]``.
+          centroids (array): Codebook values with shape ``[2**bits]``.
+          bits (int): Packed bits per key dimension (supported: ``2``, ``3``, ``4``).
+          n_repeats (int): Query/KV head repeat factor, where ``Hq = Hkv * n_repeats``.
+
+        Returns:
+          array: Score tensor with shape ``[B, Hq, L, T]`` and dtype ``float32``.
+      )pbdoc");
+
 
   m.def(
       "metal_kernel",

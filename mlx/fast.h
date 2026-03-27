@@ -3,9 +3,9 @@
 #pragma once
 
 #include <optional>
+#include <utility>
 #include <variant>
 
-#include "mlx/api.h"
 #include "mlx/utils.h"
 
 namespace mlx::core::fast {
@@ -52,6 +52,25 @@ MLX_API array scaled_dot_product_attention(
     const std::string& mask_mode = "",
     std::optional<array> mask_arr = {},
     const std::optional<array>& sinks = {},
+    StreamOrDevice s = {});
+
+/** Fused TurboQuant decode+QK score path for packed codebook indices. */
+MLX_API array turboquant_qk_packed_scores(
+    const array& q_rot,
+    const array& k_packed,
+    const array& k_norms,
+    const array& centroids,
+    int bits,
+    StreamOrDevice s = {});
+
+// Batched fused TurboQuant decode+QK score path.
+MLX_API array turboquant_qk_packed_scores_batched(
+    const array& q_rot,
+    const array& k_packed,
+    const array& k_norms,
+    const array& centroids,
+    int bits,
+    int n_repeats,
     StreamOrDevice s = {});
 
 using TemplateArg = std::variant<int, bool, Dtype>;
