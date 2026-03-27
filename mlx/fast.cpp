@@ -332,7 +332,7 @@ std::vector<array> LayerNorm::vjp(
 
     // df/db
     if (b.ndim() == 0) {
-      vjps.push_back(zeros_like(b, s));
+      vjps.push_back(zeros_like(w, s));
     } else {
       vjps.push_back(sum(g, axes, /* keepdims= */ false, s));
     }
@@ -406,23 +406,6 @@ array rope(
   if (offset.dtype().size() != 4) {
     inputs[1] = astype(offset, int32, s);
   }
-  if (dims <= 0) {
-    std::ostringstream msg;
-    msg << "[rope] dims must be positive but got " << dims << ".";
-    throw std::invalid_argument(msg.str());
-  }
-  if (dims % 2 != 0) {
-    std::ostringstream msg;
-    msg << "[rope] dims must be even but got " << dims << ".";
-    throw std::invalid_argument(msg.str());
-  }
-  if (dims > x.shape(-1)) {
-    std::ostringstream msg;
-    msg << "[rope] dims must not exceed the input's last dimension ("
-        << x.shape(-1) << ") but got " << dims << ".";
-    throw std::invalid_argument(msg.str());
-  }
-
   if (inputs.size() == 3 &&
       (inputs[2].ndim() != 1 || inputs[2].shape(0) != dims / 2)) {
     std::ostringstream msg;
@@ -737,8 +720,8 @@ array scaled_dot_product_attention(
         if (do_causal) {
           int kL = k.shape(-2);
           int qL = q.shape(-2);
-          int offset = kL - qL;
-          auto q_idx = arange(offset, qL + offset, s);
+          int q_off = (kL - qL) < 0 ? 0 : (kL - qL);
+          auto q_idx = arange(q_off, q_off + qL, s);
           auto k_idx = arange(0, kL, s);
           q_idx = expand_dims(q_idx, 1, s);
           k_idx = expand_dims(k_idx, 0, s);
@@ -859,6 +842,179 @@ array scaled_dot_product_attention(
     }
   }
   return fallback(std::move(inputs))[0];
+}
+
+array turboquant_qk_packed_scores(
+    const array& q_rot,
+    const array& k_packed,
+    const array& k_norms,
+    const array& centroids,
+    int bits,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+  if (bits != 2 && bits != 3 && bits != 4) {
+    throw std::invalid_argument(
+        "[turboquant_qk_packed_scores] bits must be one of {2, 3, 4}.");
+  }
+  if (q_rot.ndim() != 2 || k_packed.ndim() != 2 || k_norms.ndim() != 1 ||
+      centroids.ndim() != 1) {
+    throw std::invalid_argument(
+        "[turboquant_qk_packed_scores] shapes must be q_rot [Q,D], k_packed [K,W], k_norms [K], centroids [L].");
+  }
+
+  int n_queries = q_rot.shape(0);
+  int dim = q_rot.shape(1);
+  int n_keys = k_packed.shape(0);
+  if (k_norms.shape(0) != n_keys) {
+    throw std::invalid_argument(
+        "[turboquant_qk_packed_scores] k_norms length must match k_packed first dimension.");
+  }
+  int vals_per_word = 32 / bits;
+  int expected_words = (dim + vals_per_word - 1) / vals_per_word;
+  if (k_packed.shape(1) != expected_words) {
+    throw std::invalid_argument(
+        "[turboquant_qk_packed_scores] k_packed last dim does not match packed width for q_rot.shape(-1).");
+  }
+  if (centroids.shape(0) != (1 << bits)) {
+    throw std::invalid_argument(
+        "[turboquant_qk_packed_scores] centroids length must equal 2**bits.");
+  }
+
+  auto fallback = [s, bits](const std::vector<array>& inputs) {
+    const array& q = inputs[0];
+    const array& kp = inputs[1];
+    const array& norms = inputs[2];
+    const array& c = inputs[3];
+
+    int d = q.shape(1);
+    int nk = kp.shape(0);
+    int vals_per_word = 32 / bits;
+    uint32_t mask = (1u << bits) - 1u;
+
+    auto d_idx = arange(d, uint32, s);
+    auto words = floor_divide(d_idx, array(vals_per_word, uint32), s);
+    auto shifts =
+        multiply(remainder(d_idx, array(vals_per_word, uint32), s),
+                 array(bits, uint32),
+                 s);
+    auto words_2d = broadcast_to(reshape(words, {1, d}, s), {nk, d}, s);
+    auto shifts_2d = broadcast_to(reshape(shifts, {1, d}, s), {nk, d}, s);
+    auto packed_words = take_along_axis(kp, words_2d, -1, s);
+    auto idx =
+        bitwise_and(right_shift(packed_words, shifts_2d, s), array(mask, uint32), s);
+    auto z = take(c, idx, 0, s);
+    auto k_deq = multiply(z, expand_dims(norms, -1, s), s);
+    return std::vector<array>{matmul(q, swapaxes(k_deq, -1, -2, s), s)};
+  };
+
+  array q = astype(q_rot, float32, s);
+  array kp = astype(k_packed, uint32, s);
+  array norms = astype(k_norms, float32, s);
+  array c = astype(centroids, float32, s);
+  auto primitive = std::make_shared<FastTurboQuantQK>(s, std::move(fallback), bits);
+  return array(
+      {n_queries, n_keys},
+      float32,
+      primitive,
+      std::vector<array>{q, kp, norms, c});
+}
+
+array turboquant_qk_packed_scores_batched(
+    const array& q_rot,
+    const array& k_packed,
+    const array& k_norms,
+    const array& centroids,
+    int bits,
+    int n_repeats,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+  if (bits != 2 && bits != 3 && bits != 4) {
+    throw std::invalid_argument(
+        "[turboquant_qk_packed_scores_batched] bits must be one of {2, 3, 4}.");
+  }
+  if (n_repeats <= 0) {
+    throw std::invalid_argument(
+        "[turboquant_qk_packed_scores_batched] n_repeats must be > 0.");
+  }
+  if (q_rot.ndim() != 4 || k_packed.ndim() != 4 || k_norms.ndim() != 3 ||
+      centroids.ndim() != 1) {
+    throw std::invalid_argument(
+        "[turboquant_qk_packed_scores_batched] shapes must be q_rot [B,Hq,L,D], k_packed [B,Hkv,T,W], k_norms [B,Hkv,T], centroids [C].");
+  }
+
+  int B = q_rot.shape(0);
+  int Hq = q_rot.shape(1);
+  int L = q_rot.shape(2);
+  int D = q_rot.shape(3);
+  int Bk = k_packed.shape(0);
+  int Hkv = k_packed.shape(1);
+  int T = k_packed.shape(2);
+
+  if (Bk != B || k_norms.shape(0) != B || k_norms.shape(1) != Hkv ||
+      k_norms.shape(2) != T) {
+    throw std::invalid_argument(
+        "[turboquant_qk_packed_scores_batched] batch/head/time dims must match between packed keys and norms.");
+  }
+  if (Hq != Hkv * n_repeats) {
+    throw std::invalid_argument(
+        "[turboquant_qk_packed_scores_batched] q heads must equal kv heads * n_repeats.");
+  }
+
+  int vals_per_word = 32 / bits;
+  int expected_words = (D + vals_per_word - 1) / vals_per_word;
+  if (k_packed.shape(3) != expected_words) {
+    throw std::invalid_argument(
+        "[turboquant_qk_packed_scores_batched] packed width does not match q_rot last dimension.");
+  }
+  if (centroids.shape(0) != (1 << bits)) {
+    throw std::invalid_argument(
+        "[turboquant_qk_packed_scores_batched] centroids length must equal 2**bits.");
+  }
+
+  auto fallback = [s, bits, n_repeats](const std::vector<array>& inputs) {
+    const array& q = inputs[0];
+    const array& kp = inputs[1];
+    const array& norms = inputs[2];
+    const array& c = inputs[3];
+
+    int B = q.shape(0);
+    int Hq = q.shape(1);
+    int L = q.shape(2);
+    int D = q.shape(3);
+    int Hkv = kp.shape(1);
+    int T = kp.shape(2);
+    int vals_per_word = 32 / bits;
+    uint32_t mask = (1u << bits) - 1u;
+
+    auto d_idx = arange(D, uint32, s);
+    auto words = floor_divide(d_idx, array(vals_per_word, uint32), s);
+    auto shifts = multiply(
+        remainder(d_idx, array(vals_per_word, uint32), s), array(bits, uint32), s);
+
+    auto words4 = broadcast_to(
+        reshape(words, {1, 1, 1, D}, s), {B, Hkv, T, D}, s);
+    auto shifts4 = broadcast_to(
+        reshape(shifts, {1, 1, 1, D}, s), {B, Hkv, T, D}, s);
+    auto packed_words = take_along_axis(kp, words4, -1, s);
+    auto idx =
+        bitwise_and(right_shift(packed_words, shifts4, s), array(mask, uint32), s);
+    auto z = take(c, idx, 0, s);
+    auto k_deq = multiply(z, expand_dims(norms, -1, s), s); // [B,Hkv,T,D]
+
+    auto qg = reshape(q, {B, Hkv, n_repeats, L, D}, s);
+    auto kt = expand_dims(swapaxes(k_deq, -1, -2, s), 2, s); // [B,Hkv,1,D,T]
+    auto out = matmul(qg, kt, s); // [B,Hkv,n_repeats,L,T]
+    return std::vector<array>{reshape(out, {B, Hq, L, T}, s)};
+  };
+
+  array q = astype(q_rot, float32, s);
+  array kp = astype(k_packed, uint32, s);
+  array norms = astype(k_norms, float32, s);
+  array c = astype(centroids, float32, s);
+  auto primitive = std::make_shared<FastTurboQuantQKBatched>(
+      s, std::move(fallback), bits, n_repeats);
+  return array(
+      {B, Hq, L, T}, float32, primitive, std::vector<array>{q, kp, norms, c});
 }
 
 std::vector<array> ScaledDotProductAttention::vjp(

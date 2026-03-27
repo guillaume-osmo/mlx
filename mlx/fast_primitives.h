@@ -295,6 +295,68 @@ class ScaledDotProductAttentionVJP : public Custom {
   bool has_sinks_;
 };
 
+class FastTurboQuantQK : public Custom {
+ public:
+  explicit FastTurboQuantQK(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int bits)
+      : Custom(stream, std::move(fallback)), bits_(bits) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(FastTurboQuantQK);
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    return {{inputs[0].shape(0), inputs[1].shape(0)}};
+  }
+  auto state() const {
+    return std::make_pair(nullptr, bits_);
+  }
+
+ private:
+  int bits_;
+};
+
+
+class FastTurboQuantQKBatched : public Custom {
+ public:
+  explicit FastTurboQuantQKBatched(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int bits,
+      int n_repeats)
+      : Custom(stream, std::move(fallback)),
+        bits_(bits),
+        n_repeats_(n_repeats) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(FastTurboQuantQKBatched);
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    return {{
+        inputs[0].shape(0),
+        inputs[0].shape(1),
+        inputs[0].shape(2),
+        inputs[1].shape(2)}};
+  }
+  auto state() const {
+    return std::make_tuple(nullptr, bits_, n_repeats_);
+  }
+
+ private:
+  int bits_;
+  int n_repeats_;
+};
 class ConvertFP8 : public Primitive {
  public:
   explicit ConvertFP8(Stream stream, bool to_fp8)
