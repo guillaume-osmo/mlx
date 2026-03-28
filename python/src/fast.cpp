@@ -465,6 +465,56 @@ void init_fast(nb::module_& parent_module) {
           array: Output tensor with shape ``[B, Hq, L, D]`` and dtype ``float32``.
       )pbdoc");
 
+  m.def(
+      "turboquant_decode_attention_prod_batched",
+      &mx::fast::turboquant_decode_attention_prod_batched,
+      "q_rot"_a,
+      "q_model"_a,
+      "k_packed"_a,
+      "k_norms"_a,
+      "k_centroids"_a,
+      "k_bits"_a,
+      "qjl_packed"_a,
+      "qjl_gamma"_a,
+      "qjl_projection"_a,
+      "v_packed"_a,
+      "v_norms"_a,
+      "v_centroids"_a,
+      "v_bits"_a,
+      "n_repeats"_a,
+      "value_dim"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_decode_attention_prod_batched(q_rot: array, q_model: array, k_packed: array, k_norms: array, k_centroids: array, k_bits: int, qjl_packed: array, qjl_gamma: array, qjl_projection: array, v_packed: array, v_norms: array, v_centroids: array, v_bits: int, n_repeats: int, value_dim: int, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Batched TurboQuant prod/QJL decode attention path.
+
+        Computes ``out = softmax(scores_prod) @ dequant(v_packed)`` where
+        ``scores_prod`` combines the packed MSE key term with the 1-bit QJL
+        residual correction term.
+
+        Args:
+          q_rot (array): Rotated/scaled queries with shape ``[B, Hq, L, Dq]``.
+          q_model (array): Scaled queries in model space with shape ``[B, Hq, L, Dq]``.
+          k_packed (array): Packed MSE key indices with shape ``[B, Hkv, T, Wk]``.
+          k_norms (array): Key norms with shape ``[B, Hkv, T]``.
+          k_centroids (array): Key codebook values with shape ``[2**k_bits]``.
+          k_bits (int): Packed bits per key dimension (supported: ``2``, ``3``, ``4``).
+          qjl_packed (array): Packed 1-bit QJL signs with shape ``[B, Hkv, T, W1]``.
+          qjl_gamma (array): Residual norms with shape ``[B, Hkv, T]``.
+          qjl_projection (array): Gaussian QJL projection with shape ``[Dq, Dq]``.
+          v_packed (array): Packed value indices with shape ``[B, Hkv, T, Wv]``.
+          v_norms (array): Value norms with shape ``[B, Hkv, T]``.
+          v_centroids (array): Value codebook values with shape ``[2**v_bits]``.
+          v_bits (int): Packed bits per value dimension (supported: ``2``, ``3``, ``4``).
+          n_repeats (int): Query/KV head repeat factor, where ``Hq = Hkv * n_repeats``.
+          value_dim (int): Exact value head dimension before bit-packing padding.
+
+        Returns:
+          array: Output tensor with shape ``[B, Hq, L, D]`` and dtype ``float32``.
+      )pbdoc");
+
 
   m.def(
       "metal_kernel",

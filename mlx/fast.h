@@ -114,6 +114,27 @@ MLX_API array turboquant_decode_attention_packed_batched(
     int value_dim,
     StreamOrDevice s = {});
 
+// Batched TurboQuant prod/QJL decode attention:
+// out = softmax(q_rot @ dequant_mse(k).T + q_model @ dequant_qjl(qjl).T)
+//       @ dequant(v)
+MLX_API array turboquant_decode_attention_prod_batched(
+    const array& q_rot,
+    const array& q_model,
+    const array& k_packed,
+    const array& k_norms,
+    const array& k_centroids,
+    int k_bits,
+    const array& qjl_packed,
+    const array& qjl_gamma,
+    const array& qjl_projection,
+    const array& v_packed,
+    const array& v_norms,
+    const array& v_centroids,
+    int v_bits,
+    int n_repeats,
+    int value_dim,
+    StreamOrDevice s = {});
+
 using TemplateArg = std::variant<int, bool, Dtype>;
 using ScalarArg = std::variant<bool, int, float>;
 
