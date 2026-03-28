@@ -354,6 +354,46 @@ void init_fast(nb::module_& parent_module) {
           array: Score tensor with shape ``[B, Hq, L, T]`` and dtype ``float32``.
       )pbdoc");
 
+  m.def(
+      "turboquant_qk_prod_scores_batched",
+      &mx::fast::turboquant_qk_prod_scores_batched,
+      "q_rot"_a,
+      "q_model"_a,
+      "k_packed"_a,
+      "k_norms"_a,
+      "centroids"_a,
+      "bits"_a,
+      "qjl_packed"_a,
+      "qjl_gamma"_a,
+      "qjl_projection"_a,
+      "n_repeats"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_qk_prod_scores_batched(q_rot: array, q_model: array, k_packed: array, k_norms: array, centroids: array, bits: int, qjl_packed: array, qjl_gamma: array, qjl_projection: array, n_repeats: int, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Batched TurboQuant prod/QJL score path.
+
+        Computes the MSE packed-key score term with the native TurboQuant QK
+        kernel, then adds the 1-bit QJL residual correction term without
+        materializing full corrected keys.
+
+        Args:
+          q_rot (array): Rotated/scaled queries with shape ``[B, Hq, L, D]``.
+          q_model (array): Scaled queries in model space with shape ``[B, Hq, L, D]``.
+          k_packed (array): Packed MSE key indices with shape ``[B, Hkv, T, Wk]``.
+          k_norms (array): Key norms with shape ``[B, Hkv, T]``.
+          centroids (array): MSE codebook values with shape ``[2**bits]``.
+          bits (int): MSE bits for packed keys (supported: ``2``, ``3``, ``4``).
+          qjl_packed (array): Packed 1-bit QJL signs with shape ``[B, Hkv, T, W1]``.
+          qjl_gamma (array): Residual norms with shape ``[B, Hkv, T]``.
+          qjl_projection (array): Gaussian QJL projection with shape ``[D, D]``.
+          n_repeats (int): Query/KV head repeat factor, where ``Hq = Hkv * n_repeats``.
+
+        Returns:
+          array: Score tensor with shape ``[B, Hq, L, T]`` and dtype ``float32``.
+      )pbdoc");
+
 
   m.def(
       "turboquant_av_packed_values_batched",
