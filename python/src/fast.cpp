@@ -348,9 +348,81 @@ void init_fast(nb::module_& parent_module) {
           centroids (array): Codebook values with shape ``[2**bits]``.
           bits (int): Packed bits per key dimension (supported: ``2``, ``3``, ``4``).
           n_repeats (int): Query/KV head repeat factor, where ``Hq = Hkv * n_repeats``.
+          value_dim (int): Exact value head dimension before bit-packing padding.
 
         Returns:
           array: Score tensor with shape ``[B, Hq, L, T]`` and dtype ``float32``.
+      )pbdoc");
+
+
+  m.def(
+      "turboquant_av_packed_values_batched",
+      &mx::fast::turboquant_av_packed_values_batched,
+      "probs"_a,
+      "v_packed"_a,
+      "v_norms"_a,
+      "centroids"_a,
+      "bits"_a,
+      "n_repeats"_a,
+      "value_dim"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_av_packed_values_batched(probs: array, v_packed: array, v_norms: array, centroids: array, bits: int, n_repeats: int, value_dim: int, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Batched fused TurboQuant attention output from packed values.
+
+        Computes ``out = probs @ dequant(v_packed, v_norms, centroids)`` without
+        materializing dequantized values as a separate tensor.
+
+        Args:
+          probs (array): Attention probabilities with shape ``[B, Hq, L, T]``.
+          v_packed (array): Packed value indices with shape ``[B, Hkv, T, W]`` and dtype ``uint32``.
+          v_norms (array): Value norms with shape ``[B, Hkv, T]``.
+          centroids (array): Codebook values with shape ``[2**bits]``.
+          bits (int): Packed bits per value dimension (supported: ``2``, ``3``, ``4``).
+          n_repeats (int): Query/KV head repeat factor, where ``Hq = Hkv * n_repeats``.
+          value_dim (int): Exact value head dimension before bit-packing padding.
+
+        Returns:
+          array: Output tensor with shape ``[B, Hq, L, D]`` and dtype ``float32``.
+      )pbdoc");
+
+  m.def(
+      "turboquant_decode_attention_packed_batched",
+      &mx::fast::turboquant_decode_attention_packed_batched,
+      "q_rot"_a,
+      "k_packed"_a,
+      "k_norms"_a,
+      "v_packed"_a,
+      "v_norms"_a,
+      "centroids"_a,
+      "bits"_a,
+      "n_repeats"_a,
+      "value_dim"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_decode_attention_packed_batched(q_rot: array, k_packed: array, k_norms: array, v_packed: array, v_norms: array, centroids: array, bits: int, n_repeats: int, value_dim: int, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Batched fused TurboQuant decode attention kernel.
+
+        Computes ``out = softmax(q_rot @ dequant(k_packed).T) @ dequant(v_packed)``
+        without materializing score or probability tensors as separate arrays.
+
+        Args:
+          q_rot (array): Rotated/scaled queries with shape ``[B, Hq, L, Dq]``.
+          k_packed (array): Packed key indices with shape ``[B, Hkv, T, Wk]`` and dtype ``uint32``.
+          k_norms (array): Key norms with shape ``[B, Hkv, T]``.
+          v_packed (array): Packed value indices with shape ``[B, Hkv, T, Wv]`` and dtype ``uint32``.
+          v_norms (array): Value norms with shape ``[B, Hkv, T]``.
+          centroids (array): Codebook values with shape ``[2**bits]``.
+          bits (int): Packed bits per dimension (supported: ``2``, ``3``, ``4``).
+          n_repeats (int): Query/KV head repeat factor, where ``Hq = Hkv * n_repeats``.
+          value_dim (int): Exact value head dimension before bit-packing padding.
+
+        Returns:
+          array: Output tensor with shape ``[B, Hq, L, D]`` and dtype ``float32``.
       )pbdoc");
 
 

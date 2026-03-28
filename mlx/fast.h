@@ -73,6 +73,31 @@ MLX_API array turboquant_qk_packed_scores_batched(
     int n_repeats,
     StreamOrDevice s = {});
 
+// Batched fused TurboQuant attention output from packed values.
+MLX_API array turboquant_av_packed_values_batched(
+    const array& probs,
+    const array& v_packed,
+    const array& v_norms,
+    const array& centroids,
+    int bits,
+    int n_repeats,
+    int value_dim,
+    StreamOrDevice s = {});
+
+// Batched fused TurboQuant decode attention:
+// out = softmax(q_rot @ dequant(k).T) @ dequant(v)
+MLX_API array turboquant_decode_attention_packed_batched(
+    const array& q_rot,
+    const array& k_packed,
+    const array& k_norms,
+    const array& v_packed,
+    const array& v_norms,
+    const array& centroids,
+    int bits,
+    int n_repeats,
+    int value_dim,
+    StreamOrDevice s = {});
+
 using TemplateArg = std::variant<int, bool, Dtype>;
 using ScalarArg = std::variant<bool, int, float>;
 
