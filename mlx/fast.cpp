@@ -1017,6 +1017,250 @@ array turboquant_qk_packed_scores_batched(
       {B, Hq, L, T}, float32, primitive, std::vector<array>{q, kp, norms, c});
 }
 
+array turboquant_av_packed_values_batched(
+    const array& probs,
+    const array& v_packed,
+    const array& v_norms,
+    const array& centroids,
+    int bits,
+    int n_repeats,
+    int value_dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+  if (bits != 2 && bits != 3 && bits != 4) {
+    throw std::invalid_argument(
+        "[turboquant_av_packed_values_batched] bits must be one of {2, 3, 4}.");
+  }
+  if (n_repeats <= 0) {
+    throw std::invalid_argument(
+        "[turboquant_av_packed_values_batched] n_repeats must be > 0.");
+  }
+  if (probs.ndim() != 4 || v_packed.ndim() != 4 || v_norms.ndim() != 3 ||
+      centroids.ndim() != 1) {
+    throw std::invalid_argument(
+        "[turboquant_av_packed_values_batched] shapes must be probs [B,Hq,L,T], v_packed [B,Hkv,T,W], v_norms [B,Hkv,T], centroids [C].");
+  }
+
+  int B = probs.shape(0);
+  int Hq = probs.shape(1);
+  int L = probs.shape(2);
+  int T = probs.shape(3);
+  int Bv = v_packed.shape(0);
+  int Hkv = v_packed.shape(1);
+  int Tv = v_packed.shape(2);
+
+  if (Bv != B || Tv != T || v_norms.shape(0) != B || v_norms.shape(1) != Hkv ||
+      v_norms.shape(2) != T) {
+    throw std::invalid_argument(
+        "[turboquant_av_packed_values_batched] batch/head/time dims must match between packed values and norms/probs.");
+  }
+  if (Hq != Hkv * n_repeats) {
+    throw std::invalid_argument(
+        "[turboquant_av_packed_values_batched] q heads must equal kv heads * n_repeats.");
+  }
+
+  int vals_per_word = 32 / bits;
+  int W = v_packed.shape(3);
+  int expected_words = (value_dim + vals_per_word - 1) / vals_per_word;
+  if (W != expected_words) {
+    throw std::invalid_argument(
+        "[turboquant_av_packed_values_batched] packed width does not match provided value_dim.");
+  }
+  if (centroids.shape(0) != (1 << bits)) {
+    throw std::invalid_argument(
+        "[turboquant_av_packed_values_batched] centroids length must equal 2**bits.");
+  }
+
+  auto fallback = [s, bits, n_repeats, value_dim](const std::vector<array>& inputs) {
+    const array& p = inputs[0];
+    const array& vp = inputs[1];
+    const array& norms = inputs[2];
+    const array& c = inputs[3];
+
+    int B = p.shape(0);
+    int Hq = p.shape(1);
+    int L = p.shape(2);
+    int T = p.shape(3);
+    int Hkv = vp.shape(1);
+    int vals_per_word = 32 / bits;
+    int D = value_dim;
+    uint32_t mask = (1u << bits) - 1u;
+
+    auto d_idx = arange(D, uint32, s);
+    auto words = floor_divide(d_idx, array(vals_per_word, uint32), s);
+    auto shifts = multiply(
+        remainder(d_idx, array(vals_per_word, uint32), s), array(bits, uint32), s);
+
+    auto words4 = broadcast_to(
+        reshape(words, {1, 1, 1, D}, s), {B, Hkv, T, D}, s);
+    auto shifts4 = broadcast_to(
+        reshape(shifts, {1, 1, 1, D}, s), {B, Hkv, T, D}, s);
+    auto packed_words = take_along_axis(vp, words4, -1, s);
+    auto idx =
+        bitwise_and(right_shift(packed_words, shifts4, s), array(mask, uint32), s);
+    auto z = take(c, idx, 0, s);
+    auto v_deq = multiply(z, expand_dims(norms, -1, s), s); // [B,Hkv,T,D]
+
+    auto pg = reshape(p, {B, Hkv, n_repeats, L, T}, s);
+    auto vv = expand_dims(v_deq, 2, s); // [B,Hkv,1,T,D]
+    auto out = matmul(pg, vv, s); // [B,Hkv,n_repeats,L,D]
+    return std::vector<array>{reshape(out, {B, Hq, L, D}, s)};
+  };
+
+  array p = astype(probs, float32, s);
+  array vp = astype(v_packed, uint32, s);
+  array norms = astype(v_norms, float32, s);
+  array c = astype(centroids, float32, s);
+  auto primitive = std::make_shared<FastTurboQuantAVBatched>(
+      s, std::move(fallback), bits, n_repeats, value_dim);
+  return array(
+      {B, Hq, L, value_dim},
+      float32,
+      primitive,
+      std::vector<array>{p, vp, norms, c});
+}
+
+array turboquant_decode_attention_packed_batched(
+    const array& q_rot,
+    const array& k_packed,
+    const array& k_norms,
+    const array& v_packed,
+    const array& v_norms,
+    const array& centroids,
+    int bits,
+    int n_repeats,
+    int value_dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+  if (bits != 2 && bits != 3 && bits != 4) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_packed_batched] bits must be one of {2, 3, 4}.");
+  }
+  if (n_repeats <= 0) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_packed_batched] n_repeats must be > 0.");
+  }
+  if (q_rot.ndim() != 4 || k_packed.ndim() != 4 || k_norms.ndim() != 3 ||
+      v_packed.ndim() != 4 || v_norms.ndim() != 3 || centroids.ndim() != 1) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_packed_batched] shapes must be q_rot [B,Hq,L,D], k_packed [B,Hkv,T,Wk], k_norms [B,Hkv,T], v_packed [B,Hkv,T,Wv], v_norms [B,Hkv,T], centroids [C].");
+  }
+
+  int B = q_rot.shape(0);
+  int Hq = q_rot.shape(1);
+  int L = q_rot.shape(2);
+  int Dq = q_rot.shape(3);
+  int Bk = k_packed.shape(0);
+  int Hkv = k_packed.shape(1);
+  int T = k_packed.shape(2);
+
+  if (Bk != B || k_norms.shape(0) != B || k_norms.shape(1) != Hkv ||
+      k_norms.shape(2) != T || v_packed.shape(0) != B ||
+      v_packed.shape(1) != Hkv || v_packed.shape(2) != T ||
+      v_norms.shape(0) != B || v_norms.shape(1) != Hkv ||
+      v_norms.shape(2) != T) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_packed_batched] batch/head/time dims must match between packed K/V tensors and norms.");
+  }
+  if (Hq != Hkv * n_repeats) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_packed_batched] q heads must equal kv heads * n_repeats.");
+  }
+
+  int vals_per_word = 32 / bits;
+  int expected_k_words = (Dq + vals_per_word - 1) / vals_per_word;
+  int expected_v_words = (value_dim + vals_per_word - 1) / vals_per_word;
+  if (k_packed.shape(3) != expected_k_words) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_packed_batched] packed key width does not match q_rot last dimension.");
+  }
+  if (v_packed.shape(3) != expected_v_words) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_packed_batched] packed value width does not match provided value_dim.");
+  }
+  if (centroids.shape(0) != (1 << bits)) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_packed_batched] centroids length must equal 2**bits.");
+  }
+
+  auto fallback =
+      [s, bits, n_repeats, value_dim](const std::vector<array>& inputs) {
+        const array& q = inputs[0];
+        const array& kp = inputs[1];
+        const array& kn = inputs[2];
+        const array& vp = inputs[3];
+        const array& vn = inputs[4];
+        const array& c = inputs[5];
+
+        int B = q.shape(0);
+        int Hq = q.shape(1);
+        int L = q.shape(2);
+        int Dq = q.shape(3);
+        int Hkv = kp.shape(1);
+        int T = kp.shape(2);
+        int Dv = value_dim;
+        int vals_per_word = 32 / bits;
+        uint32_t mask = (1u << bits) - 1u;
+
+        auto q_idx = arange(Dq, uint32, s);
+        auto q_words = floor_divide(q_idx, array(vals_per_word, uint32), s);
+        auto q_shifts = multiply(
+            remainder(q_idx, array(vals_per_word, uint32), s),
+            array(bits, uint32),
+            s);
+        auto q_words4 = broadcast_to(
+            reshape(q_words, {1, 1, 1, Dq}, s), {B, Hkv, T, Dq}, s);
+        auto q_shifts4 = broadcast_to(
+            reshape(q_shifts, {1, 1, 1, Dq}, s), {B, Hkv, T, Dq}, s);
+        auto q_packed_words = take_along_axis(kp, q_words4, -1, s);
+        auto q_idx_unpack = bitwise_and(
+            right_shift(q_packed_words, q_shifts4, s), array(mask, uint32), s);
+        auto q_z = take(c, q_idx_unpack, 0, s);
+        auto k_deq = multiply(q_z, expand_dims(kn, -1, s), s);
+
+        auto v_idx = arange(Dv, uint32, s);
+        auto v_words = floor_divide(v_idx, array(vals_per_word, uint32), s);
+        auto v_shifts = multiply(
+            remainder(v_idx, array(vals_per_word, uint32), s),
+            array(bits, uint32),
+            s);
+        auto v_words4 = broadcast_to(
+            reshape(v_words, {1, 1, 1, Dv}, s), {B, Hkv, T, Dv}, s);
+        auto v_shifts4 = broadcast_to(
+            reshape(v_shifts, {1, 1, 1, Dv}, s), {B, Hkv, T, Dv}, s);
+        auto v_packed_words = take_along_axis(vp, v_words4, -1, s);
+        auto v_idx_unpack = bitwise_and(
+            right_shift(v_packed_words, v_shifts4, s), array(mask, uint32), s);
+        auto v_z = take(c, v_idx_unpack, 0, s);
+        auto v_deq = multiply(v_z, expand_dims(vn, -1, s), s);
+
+        auto qg = reshape(q, {B, Hkv, n_repeats, L, Dq}, s);
+        auto kt = expand_dims(swapaxes(k_deq, -1, -2, s), 2, s);
+        auto scores = matmul(qg, kt, s);
+        scores = reshape(scores, {B, Hq, L, T}, s);
+        scores = softmax(scores, std::vector<int>{-1}, true, s);
+
+        auto pg = reshape(scores, {B, Hkv, n_repeats, L, T}, s);
+        auto vv = expand_dims(v_deq, 2, s);
+        auto out = matmul(pg, vv, s);
+        return std::vector<array>{reshape(out, {B, Hq, L, Dv}, s)};
+      };
+
+  array q = astype(q_rot, float32, s);
+  array kp = astype(k_packed, uint32, s);
+  array kn = astype(k_norms, float32, s);
+  array vp = astype(v_packed, uint32, s);
+  array vn = astype(v_norms, float32, s);
+  array c = astype(centroids, float32, s);
+  auto primitive = std::make_shared<FastTurboQuantDecodeAttentionBatched>(
+      s, std::move(fallback), bits, n_repeats, value_dim);
+  return array(
+      {B, Hq, L, value_dim},
+      float32,
+      primitive,
+      std::vector<array>{q, kp, kn, vp, vn, c});
+}
+
 std::vector<array> ScaledDotProductAttention::vjp(
     const std::vector<array>& primals,
     const std::vector<array>& cotangents,

@@ -357,6 +357,82 @@ class FastTurboQuantQKBatched : public Custom {
   int bits_;
   int n_repeats_;
 };
+
+class FastTurboQuantAVBatched : public Custom {
+ public:
+  explicit FastTurboQuantAVBatched(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int bits,
+      int n_repeats,
+      int value_dim)
+      : Custom(stream, std::move(fallback)),
+        bits_(bits),
+        n_repeats_(n_repeats),
+        value_dim_(value_dim) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(FastTurboQuantAVBatched);
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    return {{
+        inputs[0].shape(0),
+        inputs[0].shape(1),
+        inputs[0].shape(2),
+        value_dim_}};
+  }
+  auto state() const {
+    return std::make_tuple(nullptr, bits_, n_repeats_, value_dim_);
+  }
+
+ private:
+  int bits_;
+  int n_repeats_;
+  int value_dim_;
+};
+
+class FastTurboQuantDecodeAttentionBatched : public Custom {
+ public:
+  explicit FastTurboQuantDecodeAttentionBatched(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int bits,
+      int n_repeats,
+      int value_dim)
+      : Custom(stream, std::move(fallback)),
+        bits_(bits),
+        n_repeats_(n_repeats),
+        value_dim_(value_dim) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(FastTurboQuantDecodeAttentionBatched);
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    return {{
+        inputs[0].shape(0),
+        inputs[0].shape(1),
+        inputs[0].shape(2),
+        value_dim_}};
+  }
+  auto state() const {
+    return std::make_tuple(nullptr, bits_, n_repeats_, value_dim_);
+  }
+
+ private:
+  int bits_;
+  int n_repeats_;
+  int value_dim_;
+};
 class ConvertFP8 : public Primitive {
  public:
   explicit ConvertFP8(Stream stream, bool to_fp8)
