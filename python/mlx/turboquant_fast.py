@@ -30,14 +30,14 @@ def pack_indices(indices: mx.array, bits: int) -> mx.array:
 
     Args:
       indices: ``(n_keys, dim)`` integer indices in ``[0, 2**bits - 1]``.
-      bits: Number of bits per index (2, 3, or 4).
+      bits: Number of bits per index (1, 2, 3, or 4).
 
     Returns:
       Packed indices of shape ``(n_keys, ceil(dim / (32//bits)))`` and dtype
       ``mx.uint32``.
     """
-    if bits not in (2, 3, 4):
-        raise ValueError(f"bits must be one of (2, 3, 4), got {bits}")
+    if bits not in (1, 2, 3, 4):
+        raise ValueError(f"bits must be one of (1, 2, 3, 4), got {bits}")
     idx_np = np.array(indices, dtype=np.uint32, copy=False)
     if idx_np.ndim != 2:
         raise ValueError(f"indices must be 2D, got shape {idx_np.shape}")

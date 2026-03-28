@@ -73,6 +73,22 @@ MLX_API array turboquant_qk_packed_scores_batched(
     int n_repeats,
     StreamOrDevice s = {});
 
+// Batched TurboQuant prod/QJL score path.
+// Computes:
+//   q_rot @ dequant_mse(k_packed).T + q_model @ dequant_qjl(qjl_packed).T
+MLX_API array turboquant_qk_prod_scores_batched(
+    const array& q_rot,
+    const array& q_model,
+    const array& k_packed,
+    const array& k_norms,
+    const array& centroids,
+    int bits,
+    const array& qjl_packed,
+    const array& qjl_gamma,
+    const array& qjl_projection,
+    int n_repeats,
+    StreamOrDevice s = {});
+
 // Batched fused TurboQuant attention output from packed values.
 MLX_API array turboquant_av_packed_values_batched(
     const array& probs,
