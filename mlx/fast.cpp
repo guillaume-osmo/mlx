@@ -1376,6 +1376,119 @@ array turboquant_decode_attention_packed_batched(
       std::vector<array>{q, kp, kn, vp, vn, c});
 }
 
+array turboquant_decode_attention_prod_batched(
+    const array& q_rot,
+    const array& q_model,
+    const array& k_packed,
+    const array& k_norms,
+    const array& k_centroids,
+    int k_bits,
+    const array& qjl_packed,
+    const array& qjl_gamma,
+    const array& qjl_projection,
+    const array& v_packed,
+    const array& v_norms,
+    const array& v_centroids,
+    int v_bits,
+    int n_repeats,
+    int value_dim,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+  if (k_bits != 2 && k_bits != 3 && k_bits != 4) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_prod_batched] k_bits must be one of {2, 3, 4}.");
+  }
+  if (v_bits != 2 && v_bits != 3 && v_bits != 4) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_prod_batched] v_bits must be one of {2, 3, 4}.");
+  }
+  if (n_repeats <= 0) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_prod_batched] n_repeats must be > 0.");
+  }
+  if (q_rot.ndim() != 4 || q_model.ndim() != 4 || k_packed.ndim() != 4 ||
+      k_norms.ndim() != 3 || k_centroids.ndim() != 1 || qjl_packed.ndim() != 4 ||
+      qjl_gamma.ndim() != 3 || qjl_projection.ndim() != 2 || v_packed.ndim() != 4 ||
+      v_norms.ndim() != 3 || v_centroids.ndim() != 1) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_prod_batched] shapes must be q_rot [B,Hq,L,D], q_model [B,Hq,L,D], k_packed [B,Hkv,T,Wk], k_norms [B,Hkv,T], k_centroids [Ck], qjl_packed [B,Hkv,T,W1], qjl_gamma [B,Hkv,T], qjl_projection [D,D], v_packed [B,Hkv,T,Wv], v_norms [B,Hkv,T], v_centroids [Cv].");
+  }
+
+  int B = q_rot.shape(0);
+  int Hq = q_rot.shape(1);
+  int L = q_rot.shape(2);
+  int Dq = q_rot.shape(3);
+  int Hkv = k_packed.shape(1);
+  int T = k_packed.shape(2);
+
+  if (q_model.shape(0) != B || q_model.shape(1) != Hq || q_model.shape(2) != L ||
+      q_model.shape(3) != Dq) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_prod_batched] q_model shape must match q_rot shape.");
+  }
+  if (k_packed.shape(0) != B || k_norms.shape(0) != B || k_norms.shape(1) != Hkv ||
+      k_norms.shape(2) != T || qjl_packed.shape(0) != B ||
+      qjl_packed.shape(1) != Hkv || qjl_packed.shape(2) != T ||
+      qjl_gamma.shape(0) != B || qjl_gamma.shape(1) != Hkv ||
+      qjl_gamma.shape(2) != T || v_packed.shape(0) != B ||
+      v_packed.shape(1) != Hkv || v_packed.shape(2) != T ||
+      v_norms.shape(0) != B || v_norms.shape(1) != Hkv ||
+      v_norms.shape(2) != T) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_prod_batched] batch/head/time dims must match between QJL, packed K/V tensors, and norms.");
+  }
+  if (Hq != Hkv * n_repeats) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_prod_batched] q heads must equal kv heads * n_repeats.");
+  }
+
+  int k_vals_per_word = 32 / k_bits;
+  int v_vals_per_word = 32 / v_bits;
+  int expected_k_words = (Dq + k_vals_per_word - 1) / k_vals_per_word;
+  int expected_qjl_words = (Dq + 31) / 32;
+  int expected_v_words = (value_dim + v_vals_per_word - 1) / v_vals_per_word;
+  if (k_packed.shape(3) != expected_k_words) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_prod_batched] packed key width does not match q_rot last dimension.");
+  }
+  if (qjl_packed.shape(3) != expected_qjl_words) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_prod_batched] packed qjl width does not match q_rot last dimension.");
+  }
+  if (v_packed.shape(3) != expected_v_words) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_prod_batched] packed value width does not match provided value_dim.");
+  }
+  if (k_centroids.shape(0) != (1 << k_bits)) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_prod_batched] key centroids length must equal 2**k_bits.");
+  }
+  if (v_centroids.shape(0) != (1 << v_bits)) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_prod_batched] value centroids length must equal 2**v_bits.");
+  }
+  if (qjl_projection.shape(0) != Dq || qjl_projection.shape(1) != Dq) {
+    throw std::invalid_argument(
+        "[turboquant_decode_attention_prod_batched] qjl_projection must have shape [D,D].");
+  }
+
+  auto scores = turboquant_qk_prod_scores_batched(
+      q_rot,
+      q_model,
+      k_packed,
+      k_norms,
+      k_centroids,
+      k_bits,
+      qjl_packed,
+      qjl_gamma,
+      qjl_projection,
+      n_repeats,
+      s);
+  auto probs = softmax(scores, std::vector<int>{-1}, true, s);
+  return turboquant_av_packed_values_batched(
+      probs, v_packed, v_norms, v_centroids, v_bits, n_repeats, value_dim, s);
+}
+
 std::vector<array> ScaledDotProductAttention::vjp(
     const std::vector<array>& primals,
     const std::vector<array>& cotangents,

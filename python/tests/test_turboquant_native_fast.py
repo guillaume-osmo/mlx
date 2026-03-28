@@ -143,6 +143,74 @@ class TestTurboQuantNativeFast(mlx_tests.MLXTestCase):
 
         self.assertTrue(mx.allclose(scores_native, scores_ref, rtol=3e-4, atol=3e-4))
 
+    @unittest.skipIf(not mx.is_available(mx.gpu), "No GPU available")
+    def test_native_prod_decode_attention_batched_matches_reference(self):
+        k_bits = 2
+        v_bits = 3
+        k_levels = 1 << k_bits
+        v_levels = 1 << v_bits
+        B, Hkv, n_repeats, L, T, D = 1, 2, 2, 1, 11, 64
+        Hq = Hkv * n_repeats
+
+        q_rot = mx.random.normal((B, Hq, L, D), dtype=mx.float32)
+        q_model = mx.random.normal((B, Hq, L, D), dtype=mx.float32)
+        k_idx = mx.random.randint(0, k_levels, (B, Hkv, T, D), dtype=mx.uint32)
+        qjl_idx = mx.random.randint(0, 2, (B, Hkv, T, D), dtype=mx.uint32)
+        v_idx = mx.random.randint(0, v_levels, (B, Hkv, T, D), dtype=mx.uint32)
+        k_norms = mx.abs(mx.random.normal((B, Hkv, T), dtype=mx.float32)) + 0.1
+        qjl_gamma = mx.abs(mx.random.normal((B, Hkv, T), dtype=mx.float32)) + 0.05
+        v_norms = mx.abs(mx.random.normal((B, Hkv, T), dtype=mx.float32)) + 0.1
+        k_centroids = mx.linspace(-1.0, 1.0, k_levels, dtype=mx.float32)
+        v_centroids = mx.linspace(-1.0, 1.0, v_levels, dtype=mx.float32)
+        projection = mx.random.normal((D, D), dtype=mx.float32)
+
+        k_packed = pack_indices(k_idx.reshape(-1, D), k_bits).reshape(B, Hkv, T, -1)
+        qjl_packed = pack_indices(qjl_idx.reshape(-1, D), 1).reshape(B, Hkv, T, -1)
+        v_packed = pack_indices(v_idx.reshape(-1, D), v_bits).reshape(B, Hkv, T, -1)
+
+        out_native = mx.fast.turboquant_decode_attention_prod_batched(
+            q_rot,
+            q_model,
+            k_packed,
+            k_norms,
+            k_centroids,
+            k_bits,
+            qjl_packed,
+            qjl_gamma,
+            projection,
+            v_packed,
+            v_norms,
+            v_centroids,
+            v_bits,
+            n_repeats,
+            D,
+        )
+
+        k_mse = mx.take(k_centroids, k_idx, axis=0) * mx.expand_dims(k_norms, axis=-1)
+        qjl_signs = mx.where(qjl_idx > 0, 1.0, -1.0).astype(mx.float32)
+        alpha = (mx.pi / 2.0) ** 0.5 / D
+        k_corr = (
+            alpha
+            * mx.expand_dims(k_norms * qjl_gamma, axis=-1)
+            * (qjl_signs @ projection)
+        )
+        v_deq = mx.take(v_centroids, v_idx, axis=0) * mx.expand_dims(v_norms, axis=-1)
+
+        qg_rot = q_rot.reshape(B, Hkv, n_repeats, L, D)
+        qg_model = q_model.reshape(B, Hkv, n_repeats, L, D)
+        mse_scores = (qg_rot @ mx.expand_dims(mx.swapaxes(k_mse, -1, -2), axis=2)).reshape(
+            B, Hq, L, T
+        )
+        corr_scores = (
+            qg_model @ mx.expand_dims(mx.swapaxes(k_corr, -1, -2), axis=2)
+        ).reshape(B, Hq, L, T)
+        probs = mx.softmax(mse_scores + corr_scores, axis=-1, precise=True)
+        out_ref = (probs.reshape(B, Hkv, n_repeats, L, T) @ mx.expand_dims(v_deq, axis=2)).reshape(
+            B, Hq, L, D
+        )
+
+        self.assertTrue(mx.allclose(out_native, out_ref, rtol=3e-4, atol=3e-4))
+
 
 
 if __name__ == "__main__":
