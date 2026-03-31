@@ -593,6 +593,147 @@ bool RoPE::is_equivalent(const Primitive& other) const {
       forward_ == a_other.forward_);
 }
 
+/** TurboQuant fused attention from compressed KV cache **/
+std::vector<array> turboquant_attention(
+    const array& queries,
+    const array& k_packed,
+    const array& k_signs,
+    const array& k_norms,
+    const array& k_res_norms,
+    const array& centroids,
+    const array& v_packed,
+    const array& v_scales,
+    const array& v_zeros,
+    const array& rotation_matrix,
+    const array& sketch_matrix,
+    const float scale,
+    const float qjl_scale,
+    const int mse_bits /* = 2 */,
+    const int v_bits /* = 2 */,
+    const int group_size /* = 32 */,
+    StreamOrDevice s /* = {} */) {
+  if (queries.ndim() != 4) {
+    std::ostringstream msg;
+    msg << "[turboquant_attention] queries must be rank 4 (B, H_q, qL, D), got "
+        << queries.shape();
+    throw std::invalid_argument(msg.str());
+  }
+  if (k_packed.ndim() != 4 || k_signs.ndim() != 4) {
+    throw std::invalid_argument(
+        "[turboquant_attention] k_packed and k_signs must be rank 4 "
+        "(B, H_kv, kL, packed_d)");
+  }
+  if (k_norms.ndim() != 3 || k_res_norms.ndim() != 3) {
+    throw std::invalid_argument(
+        "[turboquant_attention] k_norms and k_res_norms must be rank 3 "
+        "(B, H_kv, kL)");
+  }
+  if (centroids.ndim() != 1) {
+    throw std::invalid_argument(
+        "[turboquant_attention] centroids must be rank 1 (n_centroids,)");
+  }
+  if (v_packed.ndim() != 4 || v_scales.ndim() != 4 || v_zeros.ndim() != 4) {
+    throw std::invalid_argument(
+        "[turboquant_attention] v_packed, v_scales, v_zeros must be rank 4");
+  }
+  if (rotation_matrix.ndim() != 2 || sketch_matrix.ndim() != 2) {
+    throw std::invalid_argument(
+        "[turboquant_attention] rotation_matrix and sketch_matrix must be "
+        "rank 2 (D, D)");
+  }
+
+  int B = queries.shape(0);
+  int H_q = queries.shape(1);
+  int qL = queries.shape(2);
+  int D = queries.shape(3);
+  int H_kv = k_packed.shape(1);
+  int kL = k_packed.shape(2);
+
+  if (H_q % H_kv != 0) {
+    std::ostringstream msg;
+    msg << "[turboquant_attention] n_q_heads (" << H_q
+        << ") must be divisible by n_kv_heads (" << H_kv << ")";
+    throw std::invalid_argument(msg.str());
+  }
+
+  if (D != 64 && D != 128 && D != 256) {
+    throw std::invalid_argument(
+        "[turboquant_attention] head dimension D must be 64, 128, or 256, got " +
+        std::to_string(D));
+  }
+
+  if (mse_bits != 2 && mse_bits != 4) {
+    throw std::invalid_argument(
+        "[turboquant_attention] mse_bits must be 2 or 4, got " +
+        std::to_string(mse_bits));
+  }
+  if (v_bits != 2 && v_bits != 4) {
+    throw std::invalid_argument(
+        "[turboquant_attention] v_bits must be 2 or 4, got " +
+        std::to_string(v_bits));
+  }
+
+  auto stream = to_stream(s);
+  if (stream.device == Device::cpu) {
+    throw std::runtime_error(
+        "[turboquant_attention] Only supported on GPU, not CPU.");
+  }
+
+  auto final_type = queries.dtype();
+  if (!issubdtype(final_type, floating)) {
+    std::ostringstream msg;
+    msg << "[turboquant_attention] Unsupported query type " << final_type;
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto rot_t = transpose(rotation_matrix, {1, 0}, s);
+  auto sketch_t = transpose(sketch_matrix, {1, 0}, s);
+  auto q_rot = matmul(queries, rot_t, s);
+  auto q_sketch = matmul(queries, sketch_t, s);
+
+  auto fallback = [B, H_q, qL, D, scale, qjl_scale, mse_bits, v_bits, group_size, s](
+                      const std::vector<array>& inputs) {
+    auto& q_r = inputs[0];
+    auto out = zeros({B, H_q, qL, D}, q_r.dtype(), s);
+    auto m =
+        full({B, H_q, qL}, -std::numeric_limits<float>::infinity(), float32, s);
+    auto l = zeros({B, H_q, qL}, float32, s);
+    return std::vector<array>{out, m, l};
+  };
+
+  std::vector<array> inputs = {
+      astype(q_rot, final_type, s),
+      astype(q_sketch, final_type, s),
+      k_packed,
+      k_signs,
+      astype(k_norms, float32, s),
+      astype(k_res_norms, float32, s),
+      astype(centroids, float32, s),
+      v_packed,
+      astype(v_scales, float32, s),
+      astype(v_zeros, float32, s),
+  };
+
+  Shape out_shape = {B, H_q, qL, D};
+  Shape m_shape = {B, H_q, qL};
+  Shape l_shape = {B, H_q, qL};
+  auto primitive = std::make_shared<TurboQuantAttention>(
+      stream, fallback, scale, qjl_scale, mse_bits, v_bits, group_size);
+  return array::make_arrays(
+      {std::move(out_shape), std::move(m_shape), std::move(l_shape)},
+      {final_type, float32, float32},
+      primitive,
+      std::move(inputs));
+}
+
+bool TurboQuantAttention::is_equivalent(const Primitive& other) const {
+  const TurboQuantAttention& a_other =
+      static_cast<const TurboQuantAttention&>(other);
+  return scale_ == a_other.scale_ && qjl_scale_ == a_other.qjl_scale_ &&
+      mse_bits_ == a_other.mse_bits_ && v_bits_ == a_other.v_bits_ &&
+      group_size_ == a_other.group_size_;
+}
+
 /** Computes: O = softmax(Q @ K.T) @ V **/
 array scaled_dot_product_attention(
     const array& queries,
@@ -1018,6 +1159,87 @@ array turboquant_qk_packed_scores_batched(
       {B, Hq, L, T}, float32, primitive, std::vector<array>{q, kp, norms, c});
 }
 
+array turboquant_qjl_score_batched(
+    const array& q_proj,
+    const array& k_norms,
+    const array& qjl_gamma,
+    const array& qjl_packed,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+  if (q_proj.ndim() != 4 || k_norms.ndim() != 3 || qjl_gamma.ndim() != 3 ||
+      qjl_packed.ndim() != 4) {
+    throw std::invalid_argument(
+        "[turboquant_qjl_score_batched] shapes must be q_proj [B,Hkv,R,D], k_norms [B,Hkv,T], qjl_gamma [B,Hkv,T], qjl_packed [B,Hkv,T,W1].");
+  }
+
+  int B = q_proj.shape(0);
+  int Hkv = q_proj.shape(1);
+  int R = q_proj.shape(2);
+  int D = q_proj.shape(3);
+  int T = k_norms.shape(2);
+
+  if (k_norms.shape(0) != B || k_norms.shape(1) != Hkv ||
+      qjl_gamma.shape(0) != B || qjl_gamma.shape(1) != Hkv ||
+      qjl_gamma.shape(2) != T || qjl_packed.shape(0) != B ||
+      qjl_packed.shape(1) != Hkv || qjl_packed.shape(2) != T) {
+    throw std::invalid_argument(
+        "[turboquant_qjl_score_batched] batch/head/time dims must match between q_proj, norms, gamma, and qjl_packed.");
+  }
+
+  int expected_qjl_words = (D + 31) / 32;
+  if (qjl_packed.shape(3) != expected_qjl_words) {
+    throw std::invalid_argument(
+        "[turboquant_qjl_score_batched] packed qjl width does not match q_proj last dimension.");
+  }
+
+  auto fallback = [s](const std::vector<array>& inputs) {
+    const array& q = inputs[0];
+    const array& norms = inputs[1];
+    const array& gamma = inputs[2];
+    const array& qp = inputs[3];
+
+    int B = q.shape(0);
+    int Hkv = q.shape(1);
+    int R = q.shape(2);
+    int D = q.shape(3);
+    int T = norms.shape(2);
+    float alpha = float(std::sqrt(M_PI / 2.0) / D);
+
+    auto d_idx = arange(D, uint32, s);
+    auto words = floor_divide(d_idx, array(32, uint32), s);
+    auto shifts = remainder(d_idx, array(32, uint32), s);
+    auto words4 =
+        broadcast_to(reshape(words, {1, 1, 1, D}, s), {B, Hkv, T, D}, s);
+    auto shifts4 =
+        broadcast_to(reshape(shifts, {1, 1, 1, D}, s), {B, Hkv, T, D}, s);
+    auto packed_words = take_along_axis(qp, words4, -1, s);
+    auto idx = bitwise_and(
+        right_shift(packed_words, shifts4, s), array(uint32_t(1), uint32), s);
+    auto signs = subtract(
+        multiply(astype(idx, float32, s), array(2.0f, float32), s),
+        array(1.0f, float32),
+        s);
+
+    auto corr_scores = matmul(q, swapaxes(signs, -1, -2, s), s); // [B,Hkv,R,T]
+    auto corr_scale =
+        multiply(multiply(norms, gamma, s), array(alpha, float32), s);
+    corr_scores = multiply(corr_scores, expand_dims(corr_scale, 2, s), s);
+    return std::vector<array>{corr_scores};
+  };
+
+  array q = astype(q_proj, float32, s);
+  array norms = astype(k_norms, float32, s);
+  array gamma = astype(qjl_gamma, float32, s);
+  array qp = astype(qjl_packed, uint32, s);
+  auto primitive = std::make_shared<FastTurboQuantQJLScoreBatched>(
+      s, std::move(fallback));
+  return array(
+      {B, Hkv, R, T},
+      float32,
+      primitive,
+      std::vector<array>{q, norms, gamma, qp});
+}
+
 array turboquant_qk_prod_scores_batched(
     const array& q_rot,
     const array& q_model,
@@ -1041,9 +1263,10 @@ array turboquant_qk_prod_scores_batched(
   }
   if (q_rot.ndim() != 4 || q_model.ndim() != 4 || k_packed.ndim() != 4 ||
       k_norms.ndim() != 3 || centroids.ndim() != 1 || qjl_packed.ndim() != 4 ||
-      qjl_gamma.ndim() != 3 || qjl_projection.ndim() != 2) {
+      qjl_gamma.ndim() != 3 ||
+      (qjl_projection.ndim() != 1 && qjl_projection.ndim() != 2)) {
     throw std::invalid_argument(
-        "[turboquant_qk_prod_scores_batched] shapes must be q_rot [B,Hq,L,D], q_model [B,Hq,L,D], k_packed [B,Hkv,T,Wk], k_norms [B,Hkv,T], centroids [C], qjl_packed [B,Hkv,T,W1], qjl_gamma [B,Hkv,T], qjl_projection [D,D].");
+        "[turboquant_qk_prod_scores_batched] shapes must be q_rot [B,Hq,L,D], q_model [B,Hq,L,D], k_packed [B,Hkv,T,Wk], k_norms [B,Hkv,T], centroids [C], qjl_packed [B,Hkv,T,W1], qjl_gamma [B,Hkv,T], qjl_projection [D,D] or [D].");
   }
 
   int B = q_rot.shape(0);
@@ -1087,7 +1310,13 @@ array turboquant_qk_prod_scores_batched(
     throw std::invalid_argument(
         "[turboquant_qk_prod_scores_batched] centroids length must equal 2**bits.");
   }
-  if (qjl_projection.shape(0) != D || qjl_projection.shape(1) != D) {
+  bool qjl_use_wht = (qjl_projection.ndim() == 1);
+  if (qjl_use_wht) {
+    if (qjl_projection.shape(0) != D) {
+      throw std::invalid_argument(
+          "[turboquant_qk_prod_scores_batched] qjl WHT sign vector must have shape [D].");
+    }
+  } else if (qjl_projection.shape(0) != D || qjl_projection.shape(1) != D) {
     throw std::invalid_argument(
         "[turboquant_qk_prod_scores_batched] qjl_projection must have shape [D,D].");
   }
@@ -1101,34 +1330,18 @@ array turboquant_qk_prod_scores_batched(
   array norms = astype(k_norms, float32, s);
   array proj = astype(qjl_projection, float32, s);
 
-  auto q_proj = matmul(q, swapaxes(proj, -1, -2, s), s); // [B,Hq,L,D]
+  auto q_proj = q;
+  if (qjl_use_wht) {
+    auto signs = reshape(proj, {1, 1, 1, D}, s);
+    q_proj = hadamard_transform(multiply(q, signs, s), std::nullopt, s); // [B,Hq,L,D]
+  } else {
+    q_proj = matmul(q, swapaxes(proj, -1, -2, s), s); // [B,Hq,L,D]
+  }
 
-  auto d_idx = arange(D, uint32, s);
-  auto words = floor_divide(d_idx, array(32, uint32), s);
-  auto shifts = remainder(d_idx, array(32, uint32), s);
-
-  auto words4 =
-      broadcast_to(reshape(words, {1, 1, 1, D}, s), {B, Hkv, T, D}, s);
-  auto shifts4 =
-      broadcast_to(reshape(shifts, {1, 1, 1, D}, s), {B, Hkv, T, D}, s);
-  auto packed_words = take_along_axis(qp, words4, -1, s);
-  auto idx =
-      bitwise_and(right_shift(packed_words, shifts4, s), array(uint32_t(1), uint32), s);
-  auto signs = subtract(multiply(astype(idx, float32, s), array(2.0f, float32), s),
-                        array(1.0f, float32),
-                        s); // [B,Hkv,T,D] in {-1,+1}
-
-  auto qg = reshape(q_proj, {B, Hkv, n_repeats, L, D}, s);
-  auto st = expand_dims(swapaxes(signs, -1, -2, s), 2, s); // [B,Hkv,1,D,T]
-  auto corr_scores = matmul(qg, st, s); // [B,Hkv,n_repeats,L,T]
-
-  auto alpha = array(float(std::sqrt(M_PI / 2.0) / D), float32);
-  auto corr_scale =
-      multiply(multiply(norms, gamma, s), alpha, s); // [B,Hkv,T]
-  corr_scores = multiply(
-      corr_scores, expand_dims(expand_dims(corr_scale, 2, s), 2, s), s);
-
-  auto corr_out = reshape(corr_scores, {B, Hq, L, T}, s);
+  auto qg = reshape(q_proj, {B, Hkv, n_repeats * L, D}, s);
+  auto corr_scores = turboquant_qjl_score_batched(qg, norms, gamma, qp, s);
+  auto corr_out = reshape(corr_scores, {B, Hkv, n_repeats, L, T}, s);
+  corr_out = reshape(corr_out, {B, Hq, L, T}, s);
   return add(mse_scores, corr_out, s);
 }
 
@@ -1233,6 +1446,59 @@ array turboquant_av_packed_values_batched(
       float32,
       primitive,
       std::vector<array>{p, vp, norms, c});
+}
+
+static array turboquant_apply_inverse_rotation_batched(
+    const array& vectors,
+    const array& rotation,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+  if (vectors.ndim() != 4) {
+    throw std::invalid_argument(
+        "[turboquant_apply_inverse_rotation_batched] vectors must have shape [B,H,L,D].");
+  }
+  int D = vectors.shape(3);
+  if (rotation.ndim() == 2) {
+    if (rotation.shape(0) != D || rotation.shape(1) != D) {
+      throw std::invalid_argument(
+          "[turboquant_apply_inverse_rotation_batched] dense rotation must have shape [D,D].");
+    }
+    return matmul(vectors, rotation, s);
+  }
+  if (rotation.ndim() != 3 || rotation.shape(1) != 3 || rotation.shape(2) != 3) {
+    throw std::invalid_argument(
+        "[turboquant_apply_inverse_rotation_batched] block rotation must have shape [N,3,3].");
+  }
+
+  int num_blocks = rotation.shape(0);
+  int rotated_dim = num_blocks * 3;
+  if (rotated_dim > D) {
+    throw std::invalid_argument(
+        "[turboquant_apply_inverse_rotation_batched] block rotation covers more than the vector width.");
+  }
+  if (rotated_dim == 0) {
+    return vectors;
+  }
+
+  auto shape = vectors.shape();
+  auto prefix_stop = shape;
+  prefix_stop.back() = rotated_dim;
+  auto prefix = slice(vectors, {0, 0, 0, 0}, prefix_stop, s);
+  auto reshaped = reshape(
+      prefix,
+      {shape[0], shape[1], shape[2], num_blocks, 3},
+      s);
+  auto rotated = sum(
+      multiply(expand_dims(reshaped, -1, s), rotation, s),
+      -2,
+      false,
+      s);
+  rotated = reshape(rotated, prefix_stop, s);
+  if (rotated_dim == D) {
+    return rotated;
+  }
+  auto tail = slice(vectors, {0, 0, 0, rotated_dim}, shape, s);
+  return concatenate({rotated, tail}, -1, s);
 }
 
 array turboquant_decode_attention_packed_batched(
@@ -1376,6 +1642,33 @@ array turboquant_decode_attention_packed_batched(
       std::vector<array>{q, kp, kn, vp, vn, c});
 }
 
+array turboquant_decode_attention_packed_model_batched(
+    const array& q_rot,
+    const array& k_packed,
+    const array& k_norms,
+    const array& v_packed,
+    const array& v_norms,
+    const array& centroids,
+    int bits,
+    int n_repeats,
+    int value_dim,
+    const array& value_rotation,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+  auto out_rot = turboquant_decode_attention_packed_batched(
+      q_rot,
+      k_packed,
+      k_norms,
+      v_packed,
+      v_norms,
+      centroids,
+      bits,
+      n_repeats,
+      value_dim,
+      s);
+  return turboquant_apply_inverse_rotation_batched(out_rot, value_rotation, s);
+}
+
 array turboquant_decode_attention_prod_batched(
     const array& q_rot,
     const array& q_model,
@@ -1408,10 +1701,11 @@ array turboquant_decode_attention_prod_batched(
   }
   if (q_rot.ndim() != 4 || q_model.ndim() != 4 || k_packed.ndim() != 4 ||
       k_norms.ndim() != 3 || k_centroids.ndim() != 1 || qjl_packed.ndim() != 4 ||
-      qjl_gamma.ndim() != 3 || qjl_projection.ndim() != 2 || v_packed.ndim() != 4 ||
+      qjl_gamma.ndim() != 3 ||
+      (qjl_projection.ndim() != 1 && qjl_projection.ndim() != 2) || v_packed.ndim() != 4 ||
       v_norms.ndim() != 3 || v_centroids.ndim() != 1) {
     throw std::invalid_argument(
-        "[turboquant_decode_attention_prod_batched] shapes must be q_rot [B,Hq,L,D], q_model [B,Hq,L,D], k_packed [B,Hkv,T,Wk], k_norms [B,Hkv,T], k_centroids [Ck], qjl_packed [B,Hkv,T,W1], qjl_gamma [B,Hkv,T], qjl_projection [D,D], v_packed [B,Hkv,T,Wv], v_norms [B,Hkv,T], v_centroids [Cv].");
+        "[turboquant_decode_attention_prod_batched] shapes must be q_rot [B,Hq,L,D], q_model [B,Hq,L,D], k_packed [B,Hkv,T,Wk], k_norms [B,Hkv,T], k_centroids [Ck], qjl_packed [B,Hkv,T,W1], qjl_gamma [B,Hkv,T], qjl_projection [D,D] or [D], v_packed [B,Hkv,T,Wv], v_norms [B,Hkv,T], v_centroids [Cv].");
   }
 
   int B = q_rot.shape(0);
@@ -1467,7 +1761,12 @@ array turboquant_decode_attention_prod_batched(
     throw std::invalid_argument(
         "[turboquant_decode_attention_prod_batched] value centroids length must equal 2**v_bits.");
   }
-  if (qjl_projection.shape(0) != Dq || qjl_projection.shape(1) != Dq) {
+  if (qjl_projection.ndim() == 1) {
+    if (qjl_projection.shape(0) != Dq) {
+      throw std::invalid_argument(
+          "[turboquant_decode_attention_prod_batched] qjl WHT sign vector must have shape [D].");
+    }
+  } else if (qjl_projection.shape(0) != Dq || qjl_projection.shape(1) != Dq) {
     throw std::invalid_argument(
         "[turboquant_decode_attention_prod_batched] qjl_projection must have shape [D,D].");
   }
@@ -1487,6 +1786,45 @@ array turboquant_decode_attention_prod_batched(
   auto probs = softmax(scores, std::vector<int>{-1}, true, s);
   return turboquant_av_packed_values_batched(
       probs, v_packed, v_norms, v_centroids, v_bits, n_repeats, value_dim, s);
+}
+
+array turboquant_decode_attention_prod_model_batched(
+    const array& q_rot,
+    const array& q_model,
+    const array& k_packed,
+    const array& k_norms,
+    const array& k_centroids,
+    int k_bits,
+    const array& qjl_packed,
+    const array& qjl_gamma,
+    const array& qjl_projection,
+    const array& v_packed,
+    const array& v_norms,
+    const array& v_centroids,
+    int v_bits,
+    int n_repeats,
+    int value_dim,
+    const array& value_rotation,
+    StreamOrDevice s_) {
+  auto s = to_stream(s_);
+  auto out_rot = turboquant_decode_attention_prod_batched(
+      q_rot,
+      q_model,
+      k_packed,
+      k_norms,
+      k_centroids,
+      k_bits,
+      qjl_packed,
+      qjl_gamma,
+      qjl_projection,
+      v_packed,
+      v_norms,
+      v_centroids,
+      v_bits,
+      n_repeats,
+      value_dim,
+      s);
+  return turboquant_apply_inverse_rotation_batched(out_rot, value_rotation, s);
 }
 
 std::vector<array> ScaledDotProductAttention::vjp(

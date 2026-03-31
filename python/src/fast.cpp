@@ -295,6 +295,83 @@ void init_fast(nb::module_& parent_module) {
       )pbdoc");
 
   m.def(
+      "turboquant_attention",
+      [](const mx::array& queries,
+         const mx::array& k_packed,
+         const mx::array& k_signs,
+         const mx::array& k_norms,
+         const mx::array& k_res_norms,
+         const mx::array& centroids,
+         const mx::array& v_packed,
+         const mx::array& v_scales,
+         const mx::array& v_zeros,
+         const mx::array& rotation_matrix,
+         const mx::array& sketch_matrix,
+         float scale,
+         float qjl_scale,
+         int mse_bits,
+         int v_bits,
+         int group_size,
+         mx::StreamOrDevice s) {
+        auto result = mx::fast::turboquant_attention(
+            queries,
+            k_packed,
+            k_signs,
+            k_norms,
+            k_res_norms,
+            centroids,
+            v_packed,
+            v_scales,
+            v_zeros,
+            rotation_matrix,
+            sketch_matrix,
+            scale,
+            qjl_scale,
+            mse_bits,
+            v_bits,
+            group_size,
+            s);
+        return nb::make_tuple(result[0], result[1], result[2]);
+      },
+      "queries"_a,
+      "k_packed"_a,
+      "k_signs"_a,
+      "k_norms"_a,
+      "k_res_norms"_a,
+      "centroids"_a,
+      "v_packed"_a,
+      "v_scales"_a,
+      "v_zeros"_a,
+      "rotation_matrix"_a,
+      "sketch_matrix"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "qjl_scale"_a,
+      "mse_bits"_a = 2,
+      "v_bits"_a = 2,
+      "group_size"_a = 32,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_attention(queries: array, k_packed: array, "
+          "k_signs: array, k_norms: array, k_res_norms: array, "
+          "centroids: array, v_packed: array, v_scales: array, "
+          "v_zeros: array, rotation_matrix: array, sketch_matrix: array, "
+          "*, scale: float, qjl_scale: float, mse_bits: int = 2, "
+          "v_bits: int = 2, group_size: int = 32, "
+          "stream: Union[None, Stream, Device] = None) -> tuple[array, array, array]"),
+      R"pbdoc(
+        Fused attention from TurboQuant compressed KV cache data.
+
+        Computes attention directly from compressed keys (MSE quantized +
+        QJL sign correction) and quantized values, with zero intermediate
+        allocations. Implements online softmax in a single Metal kernel.
+
+        Returns:
+            tuple[array, array, array]: ``(acc, max_score, sum_exp)`` suitable
+            for log-sum-exp merge with a recent uncompressed buffer.
+      )pbdoc");
+
+  m.def(
       "turboquant_qk_packed_scores",
       &mx::fast::turboquant_qk_packed_scores,
       "q_rot"_a,
@@ -355,6 +432,33 @@ void init_fast(nb::module_& parent_module) {
       )pbdoc");
 
   m.def(
+      "turboquant_qjl_score_batched",
+      &mx::fast::turboquant_qjl_score_batched,
+      "q_proj"_a,
+      "k_norms"_a,
+      "qjl_gamma"_a,
+      "qjl_packed"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_qjl_score_batched(q_proj: array, k_norms: array, qjl_gamma: array, qjl_packed: array, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Batched packed-QJL correction score kernel.
+
+        Computes the 1-bit QJL residual score term directly from packed sign
+        bits without materializing the full sign tensor.
+
+        Args:
+          q_proj (array): Projected model-space queries with shape ``[B, Hkv, R, D]``.
+          k_norms (array): Key norms with shape ``[B, Hkv, T]``.
+          qjl_gamma (array): Residual norms with shape ``[B, Hkv, T]``.
+          qjl_packed (array): Packed 1-bit QJL signs with shape ``[B, Hkv, T, W1]``.
+
+        Returns:
+          array: Correction scores with shape ``[B, Hkv, R, T]`` and dtype ``float32``.
+      )pbdoc");
+
+  m.def(
       "turboquant_qk_prod_scores_batched",
       &mx::fast::turboquant_qk_prod_scores_batched,
       "q_rot"_a,
@@ -387,7 +491,9 @@ void init_fast(nb::module_& parent_module) {
           bits (int): MSE bits for packed keys (supported: ``2``, ``3``, ``4``).
           qjl_packed (array): Packed 1-bit QJL signs with shape ``[B, Hkv, T, W1]``.
           qjl_gamma (array): Residual norms with shape ``[B, Hkv, T]``.
-          qjl_projection (array): Gaussian QJL projection with shape ``[D, D]``.
+          qjl_projection (array): QJL transform data, either a dense Gaussian
+            projection with shape ``[D, D]`` or a WHT sign vector with shape
+            ``[D]``.
           n_repeats (int): Query/KV head repeat factor, where ``Hq = Hkv * n_repeats``.
 
         Returns:
@@ -466,6 +572,37 @@ void init_fast(nb::module_& parent_module) {
       )pbdoc");
 
   m.def(
+      "turboquant_decode_attention_packed_model_batched",
+      &mx::fast::turboquant_decode_attention_packed_model_batched,
+      "q_rot"_a,
+      "k_packed"_a,
+      "k_norms"_a,
+      "v_packed"_a,
+      "v_norms"_a,
+      "centroids"_a,
+      "bits"_a,
+      "n_repeats"_a,
+      "value_dim"_a,
+      "value_rotation"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_decode_attention_packed_model_batched(q_rot: array, k_packed: array, k_norms: array, v_packed: array, v_norms: array, centroids: array, bits: int, n_repeats: int, value_dim: int, value_rotation: array, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Batched fused TurboQuant decode attention path with the value rotation
+        applied inside MLX.
+
+        Computes ``out = inverse_rotate(softmax(q_rot @ dequant(k).T) @ dequant(v))``.
+
+        Args:
+          value_rotation (array): Dense rotation ``[D, D]`` or block rotation
+            ``[N, 3, 3]`` used to map the value output back to model space.
+
+        Returns:
+          array: Output tensor with shape ``[B, Hq, L, D]`` in model space.
+      )pbdoc");
+
+  m.def(
       "turboquant_decode_attention_prod_batched",
       &mx::fast::turboquant_decode_attention_prod_batched,
       "q_rot"_a,
@@ -503,7 +640,9 @@ void init_fast(nb::module_& parent_module) {
           k_bits (int): Packed bits per key dimension (supported: ``2``, ``3``, ``4``).
           qjl_packed (array): Packed 1-bit QJL signs with shape ``[B, Hkv, T, W1]``.
           qjl_gamma (array): Residual norms with shape ``[B, Hkv, T]``.
-          qjl_projection (array): Gaussian QJL projection with shape ``[Dq, Dq]``.
+          qjl_projection (array): QJL transform data, either a dense Gaussian
+            projection with shape ``[Dq, Dq]`` or a WHT sign vector with
+            shape ``[Dq]``.
           v_packed (array): Packed value indices with shape ``[B, Hkv, T, Wv]``.
           v_norms (array): Value norms with shape ``[B, Hkv, T]``.
           v_centroids (array): Value codebook values with shape ``[2**v_bits]``.
@@ -513,6 +652,44 @@ void init_fast(nb::module_& parent_module) {
 
         Returns:
           array: Output tensor with shape ``[B, Hq, L, D]`` and dtype ``float32``.
+      )pbdoc");
+
+  m.def(
+      "turboquant_decode_attention_prod_model_batched",
+      &mx::fast::turboquant_decode_attention_prod_model_batched,
+      "q_rot"_a,
+      "q_model"_a,
+      "k_packed"_a,
+      "k_norms"_a,
+      "k_centroids"_a,
+      "k_bits"_a,
+      "qjl_packed"_a,
+      "qjl_gamma"_a,
+      "qjl_projection"_a,
+      "v_packed"_a,
+      "v_norms"_a,
+      "v_centroids"_a,
+      "v_bits"_a,
+      "n_repeats"_a,
+      "value_dim"_a,
+      "value_rotation"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_decode_attention_prod_model_batched(q_rot: array, q_model: array, k_packed: array, k_norms: array, k_centroids: array, k_bits: int, qjl_packed: array, qjl_gamma: array, qjl_projection: array, v_packed: array, v_norms: array, v_centroids: array, v_bits: int, n_repeats: int, value_dim: int, value_rotation: array, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Batched TurboQuant prod/QJL decode attention path with the value
+        rotation applied inside MLX.
+
+        Computes
+        ``out = inverse_rotate(softmax(scores_prod) @ dequant(v_packed))``.
+
+        Args:
+          value_rotation (array): Dense rotation ``[D, D]`` or block rotation
+            ``[N, 3, 3]`` used to map the value output back to model space.
+
+        Returns:
+          array: Output tensor with shape ``[B, Hq, L, D]`` in model space.
       )pbdoc");
 
 
