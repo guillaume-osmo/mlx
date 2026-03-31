@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 
 #include "mlx/allocator.h"
@@ -299,12 +300,32 @@ void FastTurboQuantQKBatched::eval_gpu(
     block_keys = (gen >= 14) ? 16 : 8;
   }
 
+  std::string lut_mode = getenv_lower("MLX_TQ_QK_CENTROID_LUT", "auto");
+  bool use_centroid_lut = false;
+  if (use_simd && block_keys > 1 && decode_like && dim <= 256 &&
+      (bits_ == 3 || bits_ == 4)) {
+    if (lut_mode == "1" || lut_mode == "true" || lut_mode == "on" ||
+        lut_mode == "yes" || lut_mode == "lut") {
+      use_centroid_lut = true;
+    } else if (
+        lut_mode != "0" && lut_mode != "false" && lut_mode != "off" &&
+        lut_mode != "no" && lut_mode != "legacy") {
+      use_centroid_lut = true;
+    }
+  }
+
   std::string kname = "turboquant_qk_decode_batched_scalar";
   if (use_simd) {
     auto qk_blocked_name = [&](int selected_unroll) {
       std::string prefix = "turboquant_qk_decode_batched_simd_u" +
                            std::to_string(selected_unroll);
-      return (block_keys > 1) ? prefix + "_b" + std::to_string(block_keys) : prefix;
+      if (block_keys > 1) {
+        prefix += "_b" + std::to_string(block_keys);
+        if (use_centroid_lut) {
+          prefix += (bits_ == 3) ? "_lut3" : "_lut4";
+        }
+      }
+      return prefix;
     };
     if (unroll >= 4) {
       kname = qk_blocked_name(4);
@@ -366,6 +387,110 @@ bool FastTurboQuantQKBatched::is_equivalent(const Primitive& other) const {
   const FastTurboQuantQKBatched& a_other =
       static_cast<const FastTurboQuantQKBatched&>(other);
   return bits_ == a_other.bits_ && n_repeats_ == a_other.n_repeats_;
+}
+
+void FastTurboQuantQJLScoreBatched::eval_cpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  outputs = fallback_(inputs);
+}
+
+void FastTurboQuantQJLScoreBatched::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+
+  const array& q_proj = inputs[0];
+  const array& k_norms = inputs[1];
+  const array& qjl_gamma = inputs[2];
+  const array& qjl_packed = inputs[3];
+  array& out = outputs[0];
+
+  if (q_proj.dtype() != float32 || k_norms.dtype() != float32 ||
+      qjl_gamma.dtype() != float32 || qjl_packed.dtype() != uint32) {
+    outputs = fallback_(inputs);
+    return;
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  std::vector<array> copies;
+  auto copy_if_needed = [&copies, &s](const array& a) -> const array& {
+    if (a.flags().row_contiguous) {
+      return a;
+    }
+    copies.push_back(contiguous_copy_gpu(a, s));
+    return copies.back();
+  };
+
+  const array& q = copy_if_needed(q_proj);
+  const array& norms = copy_if_needed(k_norms);
+  const array& gamma = copy_if_needed(qjl_gamma);
+  const array& qp = copy_if_needed(qjl_packed);
+
+  uint32_t batch = static_cast<uint32_t>(q.shape(0));
+  uint32_t n_kv_heads = static_cast<uint32_t>(q.shape(1));
+  uint32_t repeat_count = static_cast<uint32_t>(q.shape(2));
+  uint32_t dim = static_cast<uint32_t>(q.shape(3));
+  uint32_t token_count = static_cast<uint32_t>(norms.shape(2));
+  uint32_t packed_width = static_cast<uint32_t>(qp.shape(3));
+  uint32_t expected_packed_width = (dim + 31u) / 32u;
+  if (packed_width != expected_packed_width ||
+      static_cast<uint32_t>(norms.shape(0)) != batch ||
+      static_cast<uint32_t>(norms.shape(1)) != n_kv_heads ||
+      static_cast<uint32_t>(gamma.shape(0)) != batch ||
+      static_cast<uint32_t>(gamma.shape(1)) != n_kv_heads ||
+      static_cast<uint32_t>(gamma.shape(2)) != token_count ||
+      static_cast<uint32_t>(qp.shape(0)) != batch ||
+      static_cast<uint32_t>(qp.shape(1)) != n_kv_heads ||
+      static_cast<uint32_t>(qp.shape(2)) != token_count) {
+    outputs = fallback_(inputs);
+    return;
+  }
+
+  constexpr float kPi = 3.14159265358979323846f;
+  float alpha = std::sqrt(kPi / 2.0f) / static_cast<float>(dim);
+
+  auto& enc = d.get_command_encoder(s.index);
+  bool use_blocked = (dim <= 128u && token_count >= 128u);
+  std::string kname =
+      use_blocked ? "turboquant_qjl_score_batched_b8"
+                  : "turboquant_qjl_score_batched";
+  auto kernel = d.get_kernel(kname);
+  enc.set_compute_pipeline_state(kernel);
+
+  int cidx = 0;
+  enc.set_input_array(q, cidx++);
+  enc.set_input_array(norms, cidx++);
+  enc.set_input_array(gamma, cidx++);
+  enc.set_input_array(qp, cidx++);
+  enc.set_output_array(out, cidx++);
+  enc.set_bytes(batch, cidx++);
+  enc.set_bytes(n_kv_heads, cidx++);
+  enc.set_bytes(repeat_count, cidx++);
+  enc.set_bytes(token_count, cidx++);
+  enc.set_bytes(dim, cidx++);
+  enc.set_bytes(packed_width, cidx++);
+  enc.set_bytes(alpha, cidx++);
+
+  MTL::Size group_dims(use_blocked ? 256 : 32, 1, 1);
+  MTL::Size grid_dims(
+      use_blocked
+          ? ((token_count + 7u) / 8u) * 256u
+          : 32u,
+      repeat_count,
+      use_blocked ? (batch * n_kv_heads) : (batch * n_kv_heads * token_count));
+  check_kernel_threadgroup_size(kernel, group_dims, kname);
+  enc.dispatch_threads(grid_dims, group_dims);
+
+  d.add_temporaries(std::move(copies), s.index);
+}
+
+bool FastTurboQuantQJLScoreBatched::is_equivalent(const Primitive& other) const {
+  const auto& a_other = static_cast<const FastTurboQuantQJLScoreBatched&>(other);
+  (void)a_other;
+  return true;
 }
 
 

@@ -22,6 +22,19 @@ inline float tq_acc_scalar(
   return q[q_base + d] * centroids[idx];
 }
 
+inline uint tq_unpack_index(
+    uint d,
+    uint vals_per_word,
+    uint bits,
+    uint mask,
+    uint kp_base,
+    const device uint* k_packed) {
+  uint word = d / vals_per_word;
+  uint shift = (d % vals_per_word) * bits;
+  uint packed = k_packed[kp_base + word];
+  return (packed >> shift) & mask;
+}
+
 [[host_name("turboquant_qk_decode_scalar")]] [[kernel]] void
 turboquant_qk_decode_scalar(
     const device float* q,
@@ -417,6 +430,101 @@ inline void turboquant_qk_decode_batched_simd_blocked_impl(
   }
 }
 
+template <uint UNROLL, uint BLOCK, uint CENTROIDS>
+inline void turboquant_qk_decode_batched_simd_blocked_lut_impl(
+    const device float* q,
+    const device uint* k_packed,
+    const device float* k_norms,
+    const device float* centroids,
+    device float* out,
+    constant uint& batch,
+    constant uint& n_q_heads,
+    constant uint& n_kv_heads,
+    constant uint& n_repeats,
+    constant uint& n_q_len,
+    constant uint& n_keys,
+    constant uint& dim,
+    constant uint& words_per_key,
+    constant uint& vals_per_word,
+    constant uint& bits,
+    constant uint& mask,
+    threadgroup float* q_centroid_lut,
+    uint3 tid [[thread_position_in_grid]],
+    uint tid_in_group [[thread_index_in_threadgroup]]) {
+  uint x = tid.x;
+  uint qlin = tid.y;
+  uint b = tid.z;
+
+  uint block_span = 32u * BLOCK;
+  uint block_idx = x / block_span;
+  uint within_block = x % block_span;
+  uint local_key = within_block >> 5;
+  uint lane = within_block & 31u;
+  uint n = block_idx * BLOCK + local_key;
+
+  bool valid_query = (qlin < (n_q_heads * n_q_len) && b < batch);
+  uint hq = valid_query ? (qlin / n_q_len) : 0u;
+  uint l = valid_query ? (qlin % n_q_len) : 0u;
+  uint hkv = valid_query ? (hq / n_repeats) : 0u;
+  bool valid = valid_query && (hkv < n_kv_heads) && (n < n_keys);
+
+  uint q_base = valid_query ? (((b * n_q_heads + hq) * n_q_len + l) * dim) : 0u;
+  uint kp_base = (((b * n_kv_heads + hkv) * n_keys + n) * words_per_key);
+  uint norm_idx = ((b * n_kv_heads + hkv) * n_keys + n);
+
+  uint lut_size = dim * CENTROIDS;
+  if (valid_query && local_key == 0u) {
+    for (uint lut_idx = lane; lut_idx < lut_size; lut_idx += 32u) {
+      uint d_lut = lut_idx / CENTROIDS;
+      uint c_lut = lut_idx - d_lut * CENTROIDS;
+      q_centroid_lut[lut_idx] = q[q_base + d_lut] * centroids[c_lut];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float acc = 0.0f;
+  if (valid) {
+    for (uint d = lane; d < dim; d += 32u * UNROLL) {
+      if constexpr (UNROLL >= 1) {
+        uint d0 = d;
+        if (d0 < dim) {
+          uint idx0 = tq_unpack_index(
+              d0, vals_per_word, bits, mask, kp_base, k_packed);
+          acc += q_centroid_lut[d0 * CENTROIDS + idx0];
+        }
+      }
+      if constexpr (UNROLL >= 2) {
+        uint d1 = d + 32u;
+        if (d1 < dim) {
+          uint idx1 = tq_unpack_index(
+              d1, vals_per_word, bits, mask, kp_base, k_packed);
+          acc += q_centroid_lut[d1 * CENTROIDS + idx1];
+        }
+      }
+      if constexpr (UNROLL >= 4) {
+        uint d2 = d + 64u;
+        uint d3 = d + 96u;
+        if (d2 < dim) {
+          uint idx2 = tq_unpack_index(
+              d2, vals_per_word, bits, mask, kp_base, k_packed);
+          acc += q_centroid_lut[d2 * CENTROIDS + idx2];
+        }
+        if (d3 < dim) {
+          uint idx3 = tq_unpack_index(
+              d3, vals_per_word, bits, mask, kp_base, k_packed);
+          acc += q_centroid_lut[d3 * CENTROIDS + idx3];
+        }
+      }
+    }
+  }
+
+  float sum = simd_sum(acc);
+  if (lane == 0u && valid) {
+    uint out_idx = (((b * n_q_heads + hq) * n_q_len + l) * n_keys + n);
+    out[out_idx] = sum * k_norms[norm_idx];
+  }
+}
+
 #define DEFINE_TQ_QK_BLOCK_WRAPPER(UNROLL, BLOCK)                               \
   [[host_name("turboquant_qk_decode_batched_simd_u" #UNROLL "_b" #BLOCK)]]     \
   [[kernel]] void turboquant_qk_decode_batched_simd_u##UNROLL##_b##BLOCK(      \
@@ -468,6 +576,74 @@ DEFINE_TQ_QK_BLOCK_WRAPPER(4, 16)
 DEFINE_TQ_QK_BLOCK_WRAPPER(4, 32)
 
 #undef DEFINE_TQ_QK_BLOCK_WRAPPER
+
+#define DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(UNROLL, BLOCK, CENTROIDS, TAG)          \
+  [[host_name("turboquant_qk_decode_batched_simd_u" #UNROLL "_b" #BLOCK        \
+               "_lut" #TAG)]]                                                  \
+  [[kernel]] void turboquant_qk_decode_batched_simd_u##UNROLL##_b##BLOCK##_lut##TAG( \
+      const device float* q,                                                   \
+      const device uint* k_packed,                                             \
+      const device float* k_norms,                                             \
+      const device float* centroids,                                           \
+      device float* out,                                                       \
+      constant uint& batch,                                                    \
+      constant uint& n_q_heads,                                                \
+      constant uint& n_kv_heads,                                               \
+      constant uint& n_repeats,                                                \
+      constant uint& n_q_len,                                                  \
+      constant uint& n_keys,                                                   \
+      constant uint& dim,                                                      \
+      constant uint& words_per_key,                                            \
+      constant uint& vals_per_word,                                            \
+      constant uint& bits,                                                     \
+      constant uint& mask,                                                     \
+      uint3 tid [[thread_position_in_grid]],                                   \
+      uint tid_in_group [[thread_index_in_threadgroup]]) {                     \
+    threadgroup float q_centroid_lut[256u * CENTROIDS];                        \
+    turboquant_qk_decode_batched_simd_blocked_lut_impl<                        \
+        UNROLL, BLOCK, CENTROIDS>(                                             \
+        q,                                                                     \
+        k_packed,                                                              \
+        k_norms,                                                               \
+        centroids,                                                             \
+        out,                                                                   \
+        batch,                                                                 \
+        n_q_heads,                                                             \
+        n_kv_heads,                                                            \
+        n_repeats,                                                             \
+        n_q_len,                                                               \
+        n_keys,                                                                \
+        dim,                                                                   \
+        words_per_key,                                                         \
+        vals_per_word,                                                         \
+        bits,                                                                  \
+        mask,                                                                  \
+        q_centroid_lut,                                                        \
+        tid,                                                                   \
+        tid_in_group);                                                         \
+  }
+
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(1, 8, 8, 3)
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(1, 16, 8, 3)
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(1, 32, 8, 3)
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(2, 8, 8, 3)
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(2, 16, 8, 3)
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(2, 32, 8, 3)
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(4, 8, 8, 3)
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(4, 16, 8, 3)
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(4, 32, 8, 3)
+
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(1, 8, 16, 4)
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(1, 16, 16, 4)
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(1, 32, 16, 4)
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(2, 8, 16, 4)
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(2, 16, 16, 4)
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(2, 32, 16, 4)
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(4, 8, 16, 4)
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(4, 16, 16, 4)
+DEFINE_TQ_QK_BLOCK_LUT_WRAPPER(4, 32, 16, 4)
+
+#undef DEFINE_TQ_QK_BLOCK_LUT_WRAPPER
 [[host_name("turboquant_qk_decode_batched_simd_u1")]] [[kernel]] void
 turboquant_qk_decode_batched_simd_u1(
     const device float* q,
@@ -847,6 +1023,109 @@ DEFINE_TQ_AV_BLOCK_WRAPPER(4, 16)
 DEFINE_TQ_AV_BLOCK_WRAPPER(4, 32)
 
 #undef DEFINE_TQ_AV_BLOCK_WRAPPER
+
+[[host_name("turboquant_qjl_score_batched")]] [[kernel]] void
+turboquant_qjl_score_batched(
+    const device float* q_proj,
+    const device float* k_norms,
+    const device float* qjl_gamma,
+    const device uint* qjl_packed,
+    device float* out,
+    constant uint& batch,
+    constant uint& n_kv_heads,
+    constant uint& repeat_count,
+    constant uint& token_count,
+    constant uint& dim,
+    constant uint& packed_width,
+    constant float& alpha,
+    uint3 tid [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  if (tid.x >= 32 || tid.y >= repeat_count ||
+      tid.z >= batch * n_kv_heads * token_count) {
+    return;
+  }
+
+  uint bh = tid.z / token_count;
+  uint t = tid.z % token_count;
+  uint b = bh / n_kv_heads;
+  uint h = bh % n_kv_heads;
+
+  uint q_base = ((b * n_kv_heads + h) * repeat_count + tid.y) * dim;
+  uint packed_base = ((b * n_kv_heads + h) * token_count + t) * packed_width;
+  uint norm_idx = bh * token_count + t;
+
+  float acc = 0.0f;
+  for (uint d = tid.x; d < dim; d += 32u) {
+    uint word_idx = d >> 5;
+    uint bit_offset = d & 31u;
+    uint bit = (qjl_packed[packed_base + word_idx] >> bit_offset) & 1u;
+    float sign = bit ? 1.0f : -1.0f;
+    acc += q_proj[q_base + d] * sign;
+  }
+
+  float sum = simd_sum(acc);
+  if (lane == 0u) {
+    out[((b * n_kv_heads + h) * repeat_count + tid.y) * token_count + t] =
+        sum * k_norms[norm_idx] * qjl_gamma[norm_idx] * alpha;
+  }
+}
+
+[[host_name("turboquant_qjl_score_batched_b8")]] [[kernel]] void
+turboquant_qjl_score_batched_b8(
+    const device float* q_proj,
+    const device float* k_norms,
+    const device float* qjl_gamma,
+    const device uint* qjl_packed,
+    device float* out,
+    constant uint& batch,
+    constant uint& n_kv_heads,
+    constant uint& repeat_count,
+    constant uint& token_count,
+    constant uint& dim,
+    constant uint& packed_width,
+    constant float& alpha,
+    uint3 tid [[thread_position_in_grid]],
+    uint tid_in_tg [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  uint block_span = 32u * 8u;
+  uint block_idx = tid.x / block_span;
+  uint within_block = tid.x % block_span;
+  uint local_token = within_block >> 5;
+  uint t = block_idx * 8u + local_token;
+  uint r = tid.y;
+  uint bh = tid.z;
+
+  if (t >= token_count || r >= repeat_count || bh >= batch * n_kv_heads) {
+    return;
+  }
+
+  uint b = bh / n_kv_heads;
+  uint h = bh % n_kv_heads;
+  uint q_base = ((b * n_kv_heads + h) * repeat_count + r) * dim;
+  uint packed_base = ((b * n_kv_heads + h) * token_count + t) * packed_width;
+  uint norm_idx = bh * token_count + t;
+
+  threadgroup float q_cache[128];
+  if (tid_in_tg < dim) {
+    q_cache[tid_in_tg] = q_proj[q_base + tid_in_tg];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float acc = 0.0f;
+  for (uint d = lane; d < dim; d += 32u) {
+    uint word_idx = d >> 5;
+    uint bit_offset = d & 31u;
+    uint bit = (qjl_packed[packed_base + word_idx] >> bit_offset) & 1u;
+    float sign = bit ? 1.0f : -1.0f;
+    acc += q_cache[d] * sign;
+  }
+
+  float sum = simd_sum(acc);
+  if (lane == 0u) {
+    out[((b * n_kv_heads + h) * repeat_count + r) * token_count + t] =
+        sum * k_norms[norm_idx] * qjl_gamma[norm_idx] * alpha;
+  }
+}
 
 inline float tq_lookup_centroid(
     uint d,
