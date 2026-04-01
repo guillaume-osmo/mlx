@@ -54,6 +54,9 @@ build_kernel(random)
 build_kernel(rms_norm)
 build_kernel(rope)
 build_kernel(scaled_dot_product_attention sdpa_vector.h)
+build_kernel(sdpa_vector_turboquant sdpa_vector_turboquant.h
+             steel/attn/params_turboquant.h)
+build_kernel(turboquant_qk turboquant_qk.h)
 if(MLX_METAL_VERSION GREATER_EQUAL 320)
   build_kernel(fence)
 endif()
@@ -67,7 +70,6 @@ set(STEEL_HEADERS
     steel/conv/loaders/loader_channel_n.h
     steel/conv/loaders/loader_general.h
     steel/conv/kernels/steel_conv.h
-    steel/conv/kernels/steel_conv_3d.h
     steel/conv/kernels/steel_conv_general.h
     steel/gemm/gemm.h
     steel/gemm/mma.h
@@ -108,8 +110,7 @@ set(STEEL_NAX_HEADERS
     steel/utils/type_traits.h
     steel/utils/integral_constant.h
     steel/gemm/kernels/steel_gemm_fused_nax.h
-    steel/gemm/kernels/steel_gemm_gather_nax.h
-    steel/gemm/kernels/steel_gemm_splitk_nax.h)
+    steel/gemm/kernels/steel_gemm_gather_nax.h)
 
 set(STEEL_NAX_ATTN_HEADERS
     steel/defines.h
@@ -144,7 +145,6 @@ if(NOT MLX_METAL_JIT)
   build_kernel(ternary ternary.h ternary_ops.h)
   build_kernel(unary unary.h unary_ops.h)
   build_kernel(steel/conv/kernels/steel_conv ${STEEL_HEADERS})
-  build_kernel(steel/conv/kernels/steel_conv_3d ${STEEL_HEADERS})
   build_kernel(steel/conv/kernels/steel_conv_general ${STEEL_HEADERS})
   build_kernel(steel/gemm/kernels/steel_gemm_fused ${STEEL_HEADERS})
   build_kernel(steel/gemm/kernels/steel_gemm_gather ${STEEL_HEADERS})
@@ -159,7 +159,6 @@ if(NOT MLX_METAL_JIT)
 
     build_kernel(steel/gemm/kernels/steel_gemm_fused_nax ${STEEL_NAX_HEADERS})
     build_kernel(steel/gemm/kernels/steel_gemm_gather_nax ${STEEL_NAX_HEADERS})
-    build_kernel(steel/gemm/kernels/steel_gemm_splitk_nax ${STEEL_NAX_HEADERS})
 
     build_kernel(quantized_nax quantized_nax.h ${STEEL_NAX_HEADERS})
     build_kernel(fp_quantized_nax fp4.h fp8.h fp_quantized_nax.h
@@ -168,8 +167,6 @@ if(NOT MLX_METAL_JIT)
     build_kernel(steel/attn/kernels/steel_attention_nax
                  ${STEEL_NAX_ATTN_HEADERS})
 
-  else()
-    target_compile_definitions(mlx PRIVATE MLX_METAL_NO_NAX)
   endif()
 
 endif()

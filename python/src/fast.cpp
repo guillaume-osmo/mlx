@@ -272,8 +272,6 @@ void init_fast(nb::module_& parent_module) {
                can have at most 4 dimensions and must be broadcast-compatible with
                the shape ``[B, N, T_q, T_kv]``. If an additive mask is given its
                type must promote to the promoted type of ``q``, ``k``, and ``v``.
-               The ``"causal"`` mask uses lower-right alignment where the
-               last query aligns with the last key.
             sinks (array, optional): An optional array of attention sinks.
                Default: ``None``.
 
@@ -295,6 +293,405 @@ void init_fast(nb::module_& parent_module) {
             scale = D ** -0.5
             out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="causal")
       )pbdoc");
+
+  m.def(
+      "turboquant_attention",
+      [](const mx::array& queries,
+         const mx::array& k_packed,
+         const mx::array& k_signs,
+         const mx::array& k_norms,
+         const mx::array& k_res_norms,
+         const mx::array& centroids,
+         const mx::array& v_packed,
+         const mx::array& v_scales,
+         const mx::array& v_zeros,
+         const mx::array& rotation_matrix,
+         const mx::array& sketch_matrix,
+         float scale,
+         float qjl_scale,
+         int mse_bits,
+         int v_bits,
+         int group_size,
+         mx::StreamOrDevice s) {
+        auto result = mx::fast::turboquant_attention(
+            queries,
+            k_packed,
+            k_signs,
+            k_norms,
+            k_res_norms,
+            centroids,
+            v_packed,
+            v_scales,
+            v_zeros,
+            rotation_matrix,
+            sketch_matrix,
+            scale,
+            qjl_scale,
+            mse_bits,
+            v_bits,
+            group_size,
+            s);
+        return nb::make_tuple(result[0], result[1], result[2]);
+      },
+      "queries"_a,
+      "k_packed"_a,
+      "k_signs"_a,
+      "k_norms"_a,
+      "k_res_norms"_a,
+      "centroids"_a,
+      "v_packed"_a,
+      "v_scales"_a,
+      "v_zeros"_a,
+      "rotation_matrix"_a,
+      "sketch_matrix"_a,
+      nb::kw_only(),
+      "scale"_a,
+      "qjl_scale"_a,
+      "mse_bits"_a = 2,
+      "v_bits"_a = 2,
+      "group_size"_a = 32,
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_attention(queries: array, k_packed: array, "
+          "k_signs: array, k_norms: array, k_res_norms: array, "
+          "centroids: array, v_packed: array, v_scales: array, "
+          "v_zeros: array, rotation_matrix: array, sketch_matrix: array, "
+          "*, scale: float, qjl_scale: float, mse_bits: int = 2, "
+          "v_bits: int = 2, group_size: int = 32, "
+          "stream: Union[None, Stream, Device] = None) -> tuple[array, array, array]"),
+      R"pbdoc(
+        Fused attention from TurboQuant compressed KV cache data.
+
+        Computes attention directly from compressed keys (MSE quantized +
+        QJL sign correction) and quantized values, with zero intermediate
+        allocations. Implements online softmax in a single Metal kernel.
+
+        Returns:
+            tuple[array, array, array]: ``(acc, max_score, sum_exp)`` suitable
+            for log-sum-exp merge with a recent uncompressed buffer.
+      )pbdoc");
+
+  m.def(
+      "turboquant_qk_packed_scores",
+      &mx::fast::turboquant_qk_packed_scores,
+      "q_rot"_a,
+      "k_packed"_a,
+      "k_norms"_a,
+      "centroids"_a,
+      "bits"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_qk_packed_scores(q_rot: array, k_packed: array, k_norms: array, centroids: array, bits: int, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Fused TurboQuant decode+score kernel.
+
+        Computes ``scores = q_rot @ dequant(k_packed, k_norms, centroids).T`` without
+        materializing dequantized keys as a separate tensor.
+
+        Args:
+          q_rot (array): Query matrix with shape ``[n_queries, dim]``.
+          k_packed (array): Packed key indices with shape ``[n_keys, words_per_key]`` and dtype ``uint32``.
+          k_norms (array): Key norms with shape ``[n_keys]``.
+          centroids (array): Codebook values with shape ``[2**bits]``.
+          bits (int): Packed bits per key dimension (supported: ``2``, ``3``, ``4``).
+
+        Returns:
+          array: Score matrix with shape ``[n_queries, n_keys]`` and dtype ``float32``.
+      )pbdoc");
+
+  m.def(
+      "turboquant_qk_packed_scores_batched",
+      &mx::fast::turboquant_qk_packed_scores_batched,
+      "q_rot"_a,
+      "k_packed"_a,
+      "k_norms"_a,
+      "centroids"_a,
+      "bits"_a,
+      "n_repeats"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_qk_packed_scores_batched(q_rot: array, k_packed: array, k_norms: array, centroids: array, bits: int, n_repeats: int, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Batched fused TurboQuant decode+score kernel.
+
+        Computes scores for all query heads in one call without Python head loops.
+
+        Args:
+          q_rot (array): Rotated/scaled queries with shape ``[B, Hq, L, D]``.
+          k_packed (array): Packed key indices with shape ``[B, Hkv, T, W]`` and dtype ``uint32``.
+          k_norms (array): Key norms with shape ``[B, Hkv, T]``.
+          centroids (array): Codebook values with shape ``[2**bits]``.
+          bits (int): Packed bits per key dimension (supported: ``2``, ``3``, ``4``).
+          n_repeats (int): Query/KV head repeat factor, where ``Hq = Hkv * n_repeats``.
+          value_dim (int): Exact value head dimension before bit-packing padding.
+
+        Returns:
+          array: Score tensor with shape ``[B, Hq, L, T]`` and dtype ``float32``.
+      )pbdoc");
+
+  m.def(
+      "turboquant_qjl_score_batched",
+      &mx::fast::turboquant_qjl_score_batched,
+      "q_proj"_a,
+      "k_norms"_a,
+      "qjl_gamma"_a,
+      "qjl_packed"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_qjl_score_batched(q_proj: array, k_norms: array, qjl_gamma: array, qjl_packed: array, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Batched packed-QJL correction score kernel.
+
+        Computes the 1-bit QJL residual score term directly from packed sign
+        bits without materializing the full sign tensor.
+
+        Args:
+          q_proj (array): Projected model-space queries with shape ``[B, Hkv, R, D]``.
+          k_norms (array): Key norms with shape ``[B, Hkv, T]``.
+          qjl_gamma (array): Residual norms with shape ``[B, Hkv, T]``.
+          qjl_packed (array): Packed 1-bit QJL signs with shape ``[B, Hkv, T, W1]``.
+
+        Returns:
+          array: Correction scores with shape ``[B, Hkv, R, T]`` and dtype ``float32``.
+      )pbdoc");
+
+  m.def(
+      "turboquant_qk_prod_scores_batched",
+      &mx::fast::turboquant_qk_prod_scores_batched,
+      "q_rot"_a,
+      "q_model"_a,
+      "k_packed"_a,
+      "k_norms"_a,
+      "centroids"_a,
+      "bits"_a,
+      "qjl_packed"_a,
+      "qjl_gamma"_a,
+      "qjl_projection"_a,
+      "n_repeats"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_qk_prod_scores_batched(q_rot: array, q_model: array, k_packed: array, k_norms: array, centroids: array, bits: int, qjl_packed: array, qjl_gamma: array, qjl_projection: array, n_repeats: int, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Batched TurboQuant prod/QJL score path.
+
+        Computes the MSE packed-key score term with the native TurboQuant QK
+        kernel, then adds the 1-bit QJL residual correction term without
+        materializing full corrected keys.
+
+        Args:
+          q_rot (array): Rotated/scaled queries with shape ``[B, Hq, L, D]``.
+          q_model (array): Scaled queries in model space with shape ``[B, Hq, L, D]``.
+          k_packed (array): Packed MSE key indices with shape ``[B, Hkv, T, Wk]``.
+          k_norms (array): Key norms with shape ``[B, Hkv, T]``.
+          centroids (array): MSE codebook values with shape ``[2**bits]``.
+          bits (int): MSE bits for packed keys (supported: ``2``, ``3``, ``4``).
+          qjl_packed (array): Packed 1-bit QJL signs with shape ``[B, Hkv, T, W1]``.
+          qjl_gamma (array): Residual norms with shape ``[B, Hkv, T]``.
+          qjl_projection (array): QJL transform data, either a dense Gaussian
+            projection with shape ``[D, D]`` or a WHT sign vector with shape
+            ``[D]``.
+          n_repeats (int): Query/KV head repeat factor, where ``Hq = Hkv * n_repeats``.
+
+        Returns:
+          array: Score tensor with shape ``[B, Hq, L, T]`` and dtype ``float32``.
+      )pbdoc");
+
+
+  m.def(
+      "turboquant_av_packed_values_batched",
+      &mx::fast::turboquant_av_packed_values_batched,
+      "probs"_a,
+      "v_packed"_a,
+      "v_norms"_a,
+      "centroids"_a,
+      "bits"_a,
+      "n_repeats"_a,
+      "value_dim"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_av_packed_values_batched(probs: array, v_packed: array, v_norms: array, centroids: array, bits: int, n_repeats: int, value_dim: int, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Batched fused TurboQuant attention output from packed values.
+
+        Computes ``out = probs @ dequant(v_packed, v_norms, centroids)`` without
+        materializing dequantized values as a separate tensor.
+
+        Args:
+          probs (array): Attention probabilities with shape ``[B, Hq, L, T]``.
+          v_packed (array): Packed value indices with shape ``[B, Hkv, T, W]`` and dtype ``uint32``.
+          v_norms (array): Value norms with shape ``[B, Hkv, T]``.
+          centroids (array): Codebook values with shape ``[2**bits]``.
+          bits (int): Packed bits per value dimension (supported: ``2``, ``3``, ``4``).
+          n_repeats (int): Query/KV head repeat factor, where ``Hq = Hkv * n_repeats``.
+          value_dim (int): Exact value head dimension before bit-packing padding.
+
+        Returns:
+          array: Output tensor with shape ``[B, Hq, L, D]`` and dtype ``float32``.
+      )pbdoc");
+
+  m.def(
+      "turboquant_decode_attention_packed_batched",
+      &mx::fast::turboquant_decode_attention_packed_batched,
+      "q_rot"_a,
+      "k_packed"_a,
+      "k_norms"_a,
+      "v_packed"_a,
+      "v_norms"_a,
+      "centroids"_a,
+      "bits"_a,
+      "n_repeats"_a,
+      "value_dim"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_decode_attention_packed_batched(q_rot: array, k_packed: array, k_norms: array, v_packed: array, v_norms: array, centroids: array, bits: int, n_repeats: int, value_dim: int, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Batched fused TurboQuant decode attention kernel.
+
+        Computes ``out = softmax(q_rot @ dequant(k_packed).T) @ dequant(v_packed)``
+        without materializing score or probability tensors as separate arrays.
+
+        Args:
+          q_rot (array): Rotated/scaled queries with shape ``[B, Hq, L, Dq]``.
+          k_packed (array): Packed key indices with shape ``[B, Hkv, T, Wk]`` and dtype ``uint32``.
+          k_norms (array): Key norms with shape ``[B, Hkv, T]``.
+          v_packed (array): Packed value indices with shape ``[B, Hkv, T, Wv]`` and dtype ``uint32``.
+          v_norms (array): Value norms with shape ``[B, Hkv, T]``.
+          centroids (array): Codebook values with shape ``[2**bits]``.
+          bits (int): Packed bits per dimension (supported: ``2``, ``3``, ``4``).
+          n_repeats (int): Query/KV head repeat factor, where ``Hq = Hkv * n_repeats``.
+          value_dim (int): Exact value head dimension before bit-packing padding.
+
+        Returns:
+          array: Output tensor with shape ``[B, Hq, L, D]`` and dtype ``float32``.
+      )pbdoc");
+
+  m.def(
+      "turboquant_decode_attention_packed_model_batched",
+      &mx::fast::turboquant_decode_attention_packed_model_batched,
+      "q_rot"_a,
+      "k_packed"_a,
+      "k_norms"_a,
+      "v_packed"_a,
+      "v_norms"_a,
+      "centroids"_a,
+      "bits"_a,
+      "n_repeats"_a,
+      "value_dim"_a,
+      "value_rotation"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_decode_attention_packed_model_batched(q_rot: array, k_packed: array, k_norms: array, v_packed: array, v_norms: array, centroids: array, bits: int, n_repeats: int, value_dim: int, value_rotation: array, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Batched fused TurboQuant decode attention path with the value rotation
+        applied inside MLX.
+
+        Computes ``out = inverse_rotate(softmax(q_rot @ dequant(k).T) @ dequant(v))``.
+
+        Args:
+          value_rotation (array): Dense rotation ``[D, D]`` or block rotation
+            ``[N, 3, 3]`` used to map the value output back to model space.
+
+        Returns:
+          array: Output tensor with shape ``[B, Hq, L, D]`` in model space.
+      )pbdoc");
+
+  m.def(
+      "turboquant_decode_attention_prod_batched",
+      &mx::fast::turboquant_decode_attention_prod_batched,
+      "q_rot"_a,
+      "q_model"_a,
+      "k_packed"_a,
+      "k_norms"_a,
+      "k_centroids"_a,
+      "k_bits"_a,
+      "qjl_packed"_a,
+      "qjl_gamma"_a,
+      "qjl_projection"_a,
+      "v_packed"_a,
+      "v_norms"_a,
+      "v_centroids"_a,
+      "v_bits"_a,
+      "n_repeats"_a,
+      "value_dim"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_decode_attention_prod_batched(q_rot: array, q_model: array, k_packed: array, k_norms: array, k_centroids: array, k_bits: int, qjl_packed: array, qjl_gamma: array, qjl_projection: array, v_packed: array, v_norms: array, v_centroids: array, v_bits: int, n_repeats: int, value_dim: int, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Batched TurboQuant prod/QJL decode attention path.
+
+        Computes ``out = softmax(scores_prod) @ dequant(v_packed)`` where
+        ``scores_prod`` combines the packed MSE key term with the 1-bit QJL
+        residual correction term.
+
+        Args:
+          q_rot (array): Rotated/scaled queries with shape ``[B, Hq, L, Dq]``.
+          q_model (array): Scaled queries in model space with shape ``[B, Hq, L, Dq]``.
+          k_packed (array): Packed MSE key indices with shape ``[B, Hkv, T, Wk]``.
+          k_norms (array): Key norms with shape ``[B, Hkv, T]``.
+          k_centroids (array): Key codebook values with shape ``[2**k_bits]``.
+          k_bits (int): Packed bits per key dimension (supported: ``2``, ``3``, ``4``).
+          qjl_packed (array): Packed 1-bit QJL signs with shape ``[B, Hkv, T, W1]``.
+          qjl_gamma (array): Residual norms with shape ``[B, Hkv, T]``.
+          qjl_projection (array): QJL transform data, either a dense Gaussian
+            projection with shape ``[Dq, Dq]`` or a WHT sign vector with
+            shape ``[Dq]``.
+          v_packed (array): Packed value indices with shape ``[B, Hkv, T, Wv]``.
+          v_norms (array): Value norms with shape ``[B, Hkv, T]``.
+          v_centroids (array): Value codebook values with shape ``[2**v_bits]``.
+          v_bits (int): Packed bits per value dimension (supported: ``2``, ``3``, ``4``).
+          n_repeats (int): Query/KV head repeat factor, where ``Hq = Hkv * n_repeats``.
+          value_dim (int): Exact value head dimension before bit-packing padding.
+
+        Returns:
+          array: Output tensor with shape ``[B, Hq, L, D]`` and dtype ``float32``.
+      )pbdoc");
+
+  m.def(
+      "turboquant_decode_attention_prod_model_batched",
+      &mx::fast::turboquant_decode_attention_prod_model_batched,
+      "q_rot"_a,
+      "q_model"_a,
+      "k_packed"_a,
+      "k_norms"_a,
+      "k_centroids"_a,
+      "k_bits"_a,
+      "qjl_packed"_a,
+      "qjl_gamma"_a,
+      "qjl_projection"_a,
+      "v_packed"_a,
+      "v_norms"_a,
+      "v_centroids"_a,
+      "v_bits"_a,
+      "n_repeats"_a,
+      "value_dim"_a,
+      "value_rotation"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def turboquant_decode_attention_prod_model_batched(q_rot: array, q_model: array, k_packed: array, k_norms: array, k_centroids: array, k_bits: int, qjl_packed: array, qjl_gamma: array, qjl_projection: array, v_packed: array, v_norms: array, v_centroids: array, v_bits: int, n_repeats: int, value_dim: int, value_rotation: array, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Batched TurboQuant prod/QJL decode attention path with the value
+        rotation applied inside MLX.
+
+        Computes
+        ``out = inverse_rotate(softmax(scores_prod) @ dequant(v_packed))``.
+
+        Args:
+          value_rotation (array): Dense rotation ``[D, D]`` or block rotation
+            ``[N, 3, 3]`` used to map the value output back to model space.
+
+        Returns:
+          array: Output tensor with shape ``[B, Hq, L, D]`` in model space.
+      )pbdoc");
+
 
   m.def(
       "metal_kernel",

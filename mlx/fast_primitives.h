@@ -203,6 +203,65 @@ class RoPE : public Custom {
   bool forward_;
 };
 
+class TurboQuantAttention : public Custom {
+ public:
+  TurboQuantAttention(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float scale,
+      float qjl_scale,
+      int mse_bits,
+      int v_bits,
+      int group_size)
+      : Custom(stream, std::move(fallback)),
+        scale_(scale),
+        qjl_scale_(qjl_scale),
+        mse_bits_(mse_bits),
+        v_bits_(v_bits),
+        group_size_(group_size) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    throw std::runtime_error(
+        "[turboquant_attention] Not supported on CPU, use GPU.");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  bool is_equivalent(const Primitive& other) const override;
+
+  DEFINE_NAME(TurboQuantAttention);
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const {
+    return std::make_tuple(
+        nullptr, scale_, qjl_scale_, mse_bits_, v_bits_, group_size_);
+  }
+
+  float scale() const {
+    return scale_;
+  }
+  float qjl_scale() const {
+    return qjl_scale_;
+  }
+  int mse_bits() const {
+    return mse_bits_;
+  }
+  int v_bits() const {
+    return v_bits_;
+  }
+  int group_size() const {
+    return group_size_;
+  }
+
+ private:
+  float scale_;
+  float qjl_scale_;
+  int mse_bits_;
+  int v_bits_;
+  int group_size_;
+};
+
 class ScaledDotProductAttention : public Custom {
  public:
   ScaledDotProductAttention(
@@ -295,6 +354,171 @@ class ScaledDotProductAttentionVJP : public Custom {
   bool has_sinks_;
 };
 
+class FastTurboQuantQK : public Custom {
+ public:
+  explicit FastTurboQuantQK(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int bits)
+      : Custom(stream, std::move(fallback)), bits_(bits) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(FastTurboQuantQK);
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    return {{inputs[0].shape(0), inputs[1].shape(0)}};
+  }
+  auto state() const {
+    return std::make_pair(nullptr, bits_);
+  }
+
+ private:
+  int bits_;
+};
+
+
+class FastTurboQuantQKBatched : public Custom {
+ public:
+  explicit FastTurboQuantQKBatched(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int bits,
+      int n_repeats)
+      : Custom(stream, std::move(fallback)),
+        bits_(bits),
+        n_repeats_(n_repeats) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(FastTurboQuantQKBatched);
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    return {{
+        inputs[0].shape(0),
+        inputs[0].shape(1),
+        inputs[0].shape(2),
+        inputs[1].shape(2)}};
+  }
+  auto state() const {
+    return std::make_tuple(nullptr, bits_, n_repeats_);
+  }
+
+ private:
+  int bits_;
+  int n_repeats_;
+};
+
+class FastTurboQuantQJLScoreBatched : public Custom {
+ public:
+  explicit FastTurboQuantQJLScoreBatched(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback)
+      : Custom(stream, std::move(fallback)) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(FastTurboQuantQJLScoreBatched);
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    return {{
+        inputs[0].shape(0),
+        inputs[0].shape(1),
+        inputs[0].shape(2),
+        inputs[1].shape(2)}};
+  }
+  auto state() const {
+    return nullptr;
+  }
+};
+
+class FastTurboQuantAVBatched : public Custom {
+ public:
+  explicit FastTurboQuantAVBatched(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int bits,
+      int n_repeats,
+      int value_dim)
+      : Custom(stream, std::move(fallback)),
+        bits_(bits),
+        n_repeats_(n_repeats),
+        value_dim_(value_dim) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(FastTurboQuantAVBatched);
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    return {{
+        inputs[0].shape(0),
+        inputs[0].shape(1),
+        inputs[0].shape(2),
+        value_dim_}};
+  }
+  auto state() const {
+    return std::make_tuple(nullptr, bits_, n_repeats_, value_dim_);
+  }
+
+ private:
+  int bits_;
+  int n_repeats_;
+  int value_dim_;
+};
+
+class FastTurboQuantDecodeAttentionBatched : public Custom {
+ public:
+  explicit FastTurboQuantDecodeAttentionBatched(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int bits,
+      int n_repeats,
+      int value_dim)
+      : Custom(stream, std::move(fallback)),
+        bits_(bits),
+        n_repeats_(n_repeats),
+        value_dim_(value_dim) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(FastTurboQuantDecodeAttentionBatched);
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    return {{
+        inputs[0].shape(0),
+        inputs[0].shape(1),
+        inputs[0].shape(2),
+        value_dim_}};
+  }
+  auto state() const {
+    return std::make_tuple(nullptr, bits_, n_repeats_, value_dim_);
+  }
+
+ private:
+  int bits_;
+  int n_repeats_;
+  int value_dim_;
+};
 class ConvertFP8 : public Primitive {
  public:
   explicit ConvertFP8(Stream stream, bool to_fp8)
