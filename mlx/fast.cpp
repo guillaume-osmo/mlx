@@ -50,6 +50,33 @@ std::pair<std::vector<array>, std::vector<int>> Custom::vmap(
   return {outputs, out_axes};
 }
 
+namespace {
+
+bool is_fast_rnn_dtype(Dtype t) {
+  return t == float32 || t == bfloat16;
+}
+
+std::vector<array> normalize_fast_rnn_inputs(
+    const std::vector<array>& inputs,
+    Stream s) {
+  auto target_dtype = result_type(inputs);
+  if (!is_fast_rnn_dtype(target_dtype)) {
+    target_dtype = float32;
+  }
+  std::vector<array> out;
+  out.reserve(inputs.size());
+  for (const auto& a : inputs) {
+    if (a.dtype() == target_dtype) {
+      out.push_back(a);
+    } else {
+      out.push_back(astype(a, target_dtype, s));
+    }
+  }
+  return out;
+}
+
+} // namespace
+
 array rms_norm(
     const array& x,
     const std::optional<array>& weight,
@@ -887,10 +914,11 @@ array gru_cell(
   };
   Shape out_shape{static_cast<int>(B), static_cast<int>(H)};
   auto primitive = std::make_shared<FastGruCell>(s, std::move(fallback));
-  std::vector<array> inps = {input_proj, hidden_proj, hidden_prev};
+  std::vector<array> inps =
+      normalize_fast_rnn_inputs({input_proj, hidden_proj, hidden_prev}, s);
   return array(
       std::move(out_shape),
-      result_type(input_proj, hidden_proj, hidden_prev),
+      result_type(inps),
       primitive,
       std::move(inps));
 }
@@ -931,10 +959,11 @@ array gru_cell(
   };
   Shape out_shape{static_cast<int>(B), static_cast<int>(H)};
   auto primitive = std::make_shared<FastGruCell>(s, std::move(fallback));
-  std::vector<array> inps = {input_proj, hidden_proj, hidden_prev, b};
+  std::vector<array> inps =
+      normalize_fast_rnn_inputs({input_proj, hidden_proj, hidden_prev, b}, s);
   return array(
       std::move(out_shape),
-      result_type(std::vector<array>{input_proj, hidden_proj, hidden_prev, b}),
+      result_type(inps),
       primitive,
       std::move(inps));
 }
@@ -978,13 +1007,113 @@ std::pair<array, array> lstm_cell(
     return std::vector<array>{c_new, h_new};
   };
   Shape out_shape{static_cast<int>(B), static_cast<int>(H)};
-  auto dtype = promote_types(
-      result_type(input_proj, hidden_proj, cell_prev), hidden_prev.dtype());
+  std::vector<array> fast_inputs = normalize_fast_rnn_inputs(
+      {input_proj, hidden_proj, cell_prev, hidden_prev}, s);
+  auto dtype = result_type(fast_inputs);
   auto primitive = std::make_shared<FastLSTMCell>(s, std::move(fallback));
-  std::vector<array> inputs = {input_proj, hidden_proj, cell_prev, hidden_prev};
   auto outputs = array::make_arrays(
-      {out_shape, out_shape}, {dtype, dtype}, primitive, inputs);
+      {out_shape, out_shape}, {dtype, dtype}, primitive, std::move(fast_inputs));
   return std::make_pair(std::move(outputs[0]), std::move(outputs[1]));
+}
+
+std::vector<array> FastGruCell::vjp(
+    const std::vector<array>& primals,
+    const std::vector<array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<array>& outputs) {
+  assert((primals.size() == 3 || primals.size() == 4));
+  assert(cotangents.size() == 1);
+  assert(outputs.size() == 1);
+
+  auto s = stream();
+  auto fallback = [gru = fallback_, s](const std::vector<array>& inputs) {
+    std::vector<array> p;
+    p.reserve(inputs.size() - 1);
+    for (size_t i = 0; i + 1 < inputs.size(); ++i) {
+      p.push_back(inputs[i]);
+    }
+    auto [_, vjps] = mlx::core::vjp(gru, p, {inputs.back()});
+    return vjps;
+  };
+
+  auto primitive = std::make_shared<FastGruCellVJP>(s, fallback);
+  std::vector<array> vjp_inputs = primals;
+  vjp_inputs.push_back(cotangents[0]);
+  auto vjps = array::make_arrays(
+      {primals[0].shape(), primals[1].shape(), primals[2].shape()},
+      {primals[0].dtype(), primals[1].dtype(), primals[2].dtype()},
+      primitive,
+      std::move(vjp_inputs));
+
+  std::vector<array> returned_vjps;
+  returned_vjps.reserve(argnums.size());
+  const bool has_bhn = primals.size() == 4;
+  for (auto arg : argnums) {
+    if (arg >= 0 && arg <= 2) {
+      returned_vjps.push_back(vjps[arg]);
+      continue;
+    }
+    if (arg == 3) {
+      if (!has_bhn) {
+        throw std::invalid_argument(
+            "[gru_cell] VJP with respect to bhn was requested but bhn was not provided.");
+      }
+      int h = primals[2].shape(1);
+      auto dhn = slice(
+          vjps[1],
+          {0, 2 * h},
+          {primals[1].shape(0), 3 * h},
+          s);
+      std::vector<int> axes{0};
+      returned_vjps.push_back(sum(dhn, axes, /* keepdims= */ false, s));
+      continue;
+    }
+    throw std::invalid_argument(
+        "[gru_cell] Unsupported VJP argnum. Valid argnums are 0,1,2 and optional 3 (bhn).");
+  }
+  return returned_vjps;
+}
+
+std::vector<array> FastLSTMCell::vjp(
+    const std::vector<array>& primals,
+    const std::vector<array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<array>& outputs) {
+  assert(primals.size() == 4);
+  assert(cotangents.size() == 2);
+  assert(outputs.size() == 2);
+
+  auto s = stream();
+  auto fallback = [lstm = fallback_, s](const std::vector<array>& inputs) {
+    auto [_, vjps] = mlx::core::vjp(
+        lstm,
+        {inputs[0], inputs[1], inputs[2], inputs[3]},
+        {inputs[4], inputs[5]});
+    return vjps;
+  };
+
+  auto primitive = std::make_shared<FastLSTMCellVJP>(s, fallback);
+  auto vjps = array::make_arrays(
+      {primals[0].shape(), primals[1].shape(), primals[2].shape()},
+      {primals[0].dtype(), primals[1].dtype(), primals[2].dtype()},
+      primitive,
+      {primals[0], primals[1], primals[2], primals[3], cotangents[0], cotangents[1]});
+
+  std::vector<array> returned_vjps;
+  returned_vjps.reserve(argnums.size());
+  for (auto arg : argnums) {
+    if (arg >= 0 && arg <= 2) {
+      returned_vjps.push_back(vjps[arg]);
+      continue;
+    }
+    if (arg == 3) {
+      returned_vjps.push_back(zeros_like(primals[3], s));
+      continue;
+    }
+    throw std::invalid_argument(
+        "[lstm_cell] Unsupported VJP argnum. Valid argnums are 0,1,2,3.");
+  }
+  return returned_vjps;
 }
 
 std::vector<array> ScaledDotProductAttention::vjp(

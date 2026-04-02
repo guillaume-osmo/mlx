@@ -309,19 +309,46 @@ class FastGruCell : public Custom {
   void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override;
 
+  std::vector<array> vjp(
+      const std::vector<array>& primals,
+      const std::vector<array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<array>& outputs) override;
+
   DEFINE_NAME(FastGruCell);
   bool is_equivalent(const Primitive& other) const override;
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
-    return {
-        inputs[2].shape()}; // output [B, H] = hidden_prev shape (3 or 4 inputs)
+    return {inputs[2].shape()};  // output [B, H] = hidden_prev shape (3 or 4 inputs)
   }
   auto state() const {
     return std::make_tuple(nullptr);
   }
 };
 
-// Fused LSTM cell (Metal RNN). One step: cell_new = f*c_prev + i*g, hidden_new
-// = o*tanh(cell_new).
+class FastGruCellVJP : public Custom {
+ public:
+  explicit FastGruCellVJP(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback)
+      : Custom(stream, std::move(fallback)) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(FastGruCellVJP);
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    return {inputs[0].shape(), inputs[1].shape(), inputs[2].shape()};
+  }
+  auto state() const {
+    return std::make_tuple(nullptr);
+  }
+};
+
+// Fused LSTM cell (Metal RNN). One step: cell_new = f*c_prev + i*g, hidden_new = o*tanh(cell_new).
 class FastLSTMCell : public Custom {
  public:
   explicit FastLSTMCell(
@@ -335,10 +362,39 @@ class FastLSTMCell : public Custom {
   void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override;
 
+  std::vector<array> vjp(
+      const std::vector<array>& primals,
+      const std::vector<array>& cotangents,
+      const std::vector<int>& argnums,
+      const std::vector<array>& outputs) override;
+
   DEFINE_NAME(FastLSTMCell);
   bool is_equivalent(const Primitive& other) const override;
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
-    return {inputs[2].shape(), inputs[3].shape()}; // cell [B,H], hidden [B,H]
+    return {inputs[2].shape(), inputs[3].shape()};  // cell [B,H], hidden [B,H]
+  }
+  auto state() const {
+    return std::make_tuple(nullptr);
+  }
+};
+
+class FastLSTMCellVJP : public Custom {
+ public:
+  explicit FastLSTMCellVJP(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback)
+      : Custom(stream, std::move(fallback)) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(FastLSTMCellVJP);
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    return {inputs[0].shape(), inputs[1].shape(), inputs[2].shape()};
   }
   auto state() const {
     return std::make_tuple(nullptr);

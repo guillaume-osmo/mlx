@@ -10,6 +10,7 @@ Set before importing `mlx.nn` to choose the implementation:
 |----------|----------|
 | `legacy` | **Previous (Python-only)** – no Metal fast cells; pure Python ops per step. Use to compare or revert. |
 | `fast`   | **Current default** – use `mx.fast.gru_cell` / `mx.fast.lstm_cell` when available and initial hidden/cell are set. |
+| `fast_v2`| Reserved for future (e.g. precomputed layout); currently same as `fast`. |
 
 Example (revert to previous behavior):
 
@@ -50,7 +51,7 @@ MLX_RNN_IMPL=fast   python recurrent_bench.py
   - `hidden = (1 - z) * n + z * hidden`.
 - Many small ops and kernel launches per step.
 
-**Fast path (when `MLX_RNN_IMPL` is `fast` and `mx.fast.gru_cell` exists)**
+**Fast path (when `MLX_RNN_IMPL` is `fast` or `fast_v2` and `mx.fast.gru_cell` exists)**
 
 - Same initial matmul; precompute `bhn_padded` once (zeros for r,z, `bhn` for n) to avoid per-step concat.
 - Per step:
@@ -98,6 +99,7 @@ MLX_RNN_IMPL=fast   python recurrent_bench.py
 |----------|--------------------|---------------------|--------|
 | legacy   | ~0.31 ms (Python)  | ~0.18 ms (Python)   | `MLX_RNN_IMPL=legacy` |
 | fast     | ~0.08 ms (Metal)   | ~0.08 ms (Metal)    | default; no env |
+| fast_v2  | Same as fast       | Same as fast        | reserved |
 
 **Caution:** To “go back in time”, set `MLX_RNN_IMPL=legacy` before any `import mlx.nn`. The implementation is chosen at import time.
 

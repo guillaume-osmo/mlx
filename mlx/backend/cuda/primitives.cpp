@@ -49,7 +49,17 @@ void FastGruCell::eval_gpu(
     std::vector<array>& outputs) {
   outputs = fallback_(inputs);
 }
+void FastGruCellVJP::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  outputs = fallback_(inputs);
+}
 void FastLSTMCell::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  outputs = fallback_(inputs);
+}
+void FastLSTMCellVJP::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
   outputs = fallback_(inputs);

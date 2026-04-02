@@ -272,7 +272,7 @@ inline bool is_nax_available() {
   auto _check_nax = []() {
     bool can_use_nax = false;
     if (__builtin_available(
-            macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *)) {
+            macOS 26.2, *)) {
       can_use_nax = true;
     }
     auto& d = metal::device(mlx::core::Device::gpu);
