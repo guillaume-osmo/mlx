@@ -77,7 +77,6 @@ MLX_API array scaled_dot_product_attention(
     const std::optional<array>& sinks = {},
     StreamOrDevice s = {});
 
-<<<<<<< HEAD
 /** Fused TurboQuant decode+QK score path for packed codebook indices. */
 MLX_API array turboquant_qk_packed_scores(
     const array& q_rot,
@@ -211,8 +210,7 @@ MLX_API array gru_cell(
     const array& hidden_prev,
     StreamOrDevice s = {});
 
-/** Same with optional recurrent bias bhn [H] for n-gate; avoids per-step add in
- * Python. */
+/** Same with optional recurrent bias bhn [H] for n-gate; avoids per-step add in Python. */
 MLX_API array gru_cell(
     const array& input_proj,
     const array& hidden_proj,
@@ -220,8 +218,7 @@ MLX_API array gru_cell(
     const std::optional<array>& bhn,
     StreamOrDevice s = {});
 
-/** Fused LSTM cell (Metal RNN). One step: cell_new = f*c_prev + i*g, hidden_new
- * = o*tanh(cell_new). */
+/** Fused LSTM cell (Metal RNN). One step: cell_new = f*c_prev + i*g, hidden_new = o*tanh(cell_new). */
 MLX_API std::pair<array, array> lstm_cell(
     const array& input_proj,
     const array& hidden_proj,
