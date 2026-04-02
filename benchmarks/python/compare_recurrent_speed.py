@@ -57,9 +57,7 @@ def run_bench(impl: str, device: str, num_runs: int = 3):
 def main():
     print("Comparing nn.GRU / nn.LSTM: legacy (Python-only) vs fast (Metal)")
     print("(batch=32, seq=40, input=128, hidden=200, h0/c0 set)")
-    print(
-        "(median of 3 runs per config; each run = median of 5×100 iters for stability)"
-    )
+    print("(median of 3 runs per config; each run = median of 5×100 iters for stability)")
     print()
 
     gru_legacy_gpu, lstm_legacy_gpu = run_bench("legacy", "gpu")
@@ -73,15 +71,9 @@ def main():
     print("=" * 70)
     print("Full layer timings (ms)")
     print("=" * 70)
-    print(
-        f"  {'Layer':<12}  {'legacy GPU':>12}  {'fast GPU':>12}  {'legacy CPU':>12}  {'fast CPU':>12}"
-    )
-    print(
-        f"  {'nn.GRU':<12}  {fmt(gru_legacy_gpu):>12}  {fmt(gru_fast_gpu):>12}  {fmt(gru_legacy_cpu):>12}  {fmt(gru_fast_cpu):>12}"
-    )
-    print(
-        f"  {'nn.LSTM':<12}  {fmt(lstm_legacy_gpu):>12}  {fmt(lstm_fast_gpu):>12}  {fmt(lstm_legacy_cpu):>12}  {fmt(lstm_fast_cpu):>12}"
-    )
+    print(f"  {'Layer':<12}  {'legacy GPU':>12}  {'fast GPU':>12}  {'legacy CPU':>12}  {'fast CPU':>12}")
+    print(f"  {'nn.GRU':<12}  {fmt(gru_legacy_gpu):>12}  {fmt(gru_fast_gpu):>12}  {fmt(gru_legacy_cpu):>12}  {fmt(gru_fast_cpu):>12}")
+    print(f"  {'nn.LSTM':<12}  {fmt(lstm_legacy_gpu):>12}  {fmt(lstm_fast_gpu):>12}  {fmt(lstm_legacy_cpu):>12}  {fmt(lstm_fast_cpu):>12}")
     print()
 
     print("Speedup (fast vs legacy) on same device:")
@@ -93,15 +85,11 @@ def main():
         print(f"  CPU  GRU:  {gru_legacy_cpu / gru_fast_cpu:.2f}x")
     if lstm_fast_cpu > 0 and not (lstm_legacy_cpu != lstm_legacy_cpu):
         print(f"  CPU  LSTM: {lstm_legacy_cpu / lstm_fast_cpu:.2f}x")
-    if gru_fast_cpu != gru_fast_cpu or lstm_fast_cpu != lstm_fast_cpu:
-        print(
-            "  (fast on CPU: Metal kernels are GPU-only; fast path falls back or N/A)"
-        )
+    if (gru_fast_cpu != gru_fast_cpu or lstm_fast_cpu != lstm_fast_cpu):
+        print("  (fast on CPU: Metal kernels are GPU-only; fast path falls back or N/A)")
     print()
 
-    print(
-        "Legacy: Python-only. Fast: Metal kernels on GPU; on CPU fast uses fallback (may be N/A)."
-    )
+    print("Legacy: Python-only. Fast: Metal kernels on GPU; on CPU fast uses fallback (may be N/A).")
     print("To use legacy: export MLX_RNN_IMPL=legacy")
     print("See python/mlx/nn/layers/RECURRENT_VERSIONS.md for details.")
 

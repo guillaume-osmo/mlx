@@ -19,12 +19,8 @@ from time_utils import measure_runtime
 
 
 def main():
-    p = argparse.ArgumentParser(
-        description="Benchmark nn.GRU / nn.LSTM (legacy vs fast)"
-    )
-    p.add_argument(
-        "--device", choices=("gpu", "cpu"), default="gpu", help="Device to run on"
-    )
+    p = argparse.ArgumentParser(description="Benchmark nn.GRU / nn.LSTM (legacy vs fast)")
+    p.add_argument("--device", choices=("gpu", "cpu"), default="gpu", help="Device to run on")
     args = p.parse_args()
 
     impl = os.environ.get("MLX_RNN_IMPL", "fast").strip().lower()
@@ -59,12 +55,8 @@ def main():
     lstm_ms = measure_runtime(lstm_forward)
 
     print(f"MLX_RNN_IMPL={impl} device={args.device}")
-    print(
-        f"  nn.GRU({batch}, {seq_len}, {input_size} -> {hidden_size}): {gru_ms:.3f} ms"
-    )
-    print(
-        f"  nn.LSTM({batch}, {seq_len}, {input_size} -> {hidden_size}): {lstm_ms:.3f} ms"
-    )
+    print(f"  nn.GRU({batch}, {seq_len}, {input_size} -> {hidden_size}): {gru_ms:.3f} ms")
+    print(f"  nn.LSTM({batch}, {seq_len}, {input_size} -> {hidden_size}): {lstm_ms:.3f} ms")
 
 
 if __name__ == "__main__":
