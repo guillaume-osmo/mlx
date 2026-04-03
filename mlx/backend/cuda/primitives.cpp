@@ -63,6 +63,16 @@ void FastLSTMCellVJP::eval_gpu(
     std::vector<array>& outputs) {
   outputs = fallback_(inputs);
 }
+void FastLSTMSequence::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  outputs = fallback_(inputs);
+}
+void FastGRUSequence::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  outputs = fallback_(inputs);
+}
 } // namespace fast
 NO_GPU_MULTI(Eig)
 NO_GPU_MULTI(Eigh)

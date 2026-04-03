@@ -30,6 +30,7 @@ def _save_ref(ref_path: str) -> None:
     import mlx.core as mx
     import mlx.nn as nn
 
+    mx.set_default_device(mx.gpu)
     mx.random.seed(SEED_WEIGHTS)
     gru = nn.GRU(INPUT_SIZE, HIDDEN_SIZE, bias=True)
     lstm = nn.LSTM(INPUT_SIZE, HIDDEN_SIZE, bias=True)
@@ -65,11 +66,12 @@ def _to_contiguous(arr) -> "mx.array":
     return mx.array(np.ascontiguousarray(np.array(arr, dtype=np.float32)))
 
 
-def _run_fast_and_compare(ref_path: str) -> bool:
-    """Subprocess: MLX_RNN_IMPL=fast. Load ref, to_contiguous, update model, forward, compare. Returns True if allclose."""
+def _run_impl_and_compare(ref_path: str) -> bool:
+    """Subprocess: load ref, run current MLX_RNN_IMPL, compare to legacy outputs."""
     import mlx.core as mx
     import mlx.nn as nn
 
+    mx.set_default_device(mx.gpu)
     data = mx.load(ref_path)
 
     gru = nn.GRU(INPUT_SIZE, HIDDEN_SIZE, bias=True)
@@ -128,7 +130,7 @@ class TestRecurrentFastVsLegacy(mlx_tests.MLXTestCase):
             self.assertEqual(r1.returncode, 0, f"legacy save_ref failed: {r1.stderr}")
 
             r2 = subprocess.run(
-                [sys.executable, runner, "run_fast_and_compare", ref_path],
+                [sys.executable, runner, "run_impl_and_compare", ref_path],
                 env={**os.environ, "MLX_RNN_IMPL": "fast"},
                 cwd=test_dir,
                 capture_output=True,
@@ -137,12 +139,22 @@ class TestRecurrentFastVsLegacy(mlx_tests.MLXTestCase):
             )
             self.assertEqual(r2.returncode, 0, f"fast run_fast_and_compare failed (legacy vs fast differ): {r2.stderr}")
 
+            r3 = subprocess.run(
+                [sys.executable, runner, "run_impl_and_compare", ref_path],
+                env={**os.environ, "MLX_RNN_IMPL": "fast_v2"},
+                cwd=test_dir,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(r3.returncode, 0, f"fast_v2 run_impl_and_compare failed (legacy vs fast_v2 differ): {r3.stderr}")
+
 
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "save_ref":
         _save_ref(sys.argv[2])
         sys.exit(0)
-    if len(sys.argv) >= 3 and sys.argv[1] == "run_fast_and_compare":
-        ok = _run_fast_and_compare(sys.argv[2])
+    if len(sys.argv) >= 3 and sys.argv[1] == "run_impl_and_compare":
+        ok = _run_impl_and_compare(sys.argv[2])
         sys.exit(0 if ok else 1)
     unittest.main()

@@ -626,6 +626,61 @@ class FastLSTMCellVJP : public Custom {
   }
 };
 
+// Full-sequence LSTM: loops T timesteps in C++, dispatching matmul + gate
+// kernel per step.  Eliminates Python loop overhead.
+// VJP is handled by the base Custom class (traces through the fallback).
+class FastLSTMSequence : public Custom {
+ public:
+  explicit FastLSTMSequence(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback)
+      : Custom(stream, std::move(fallback)) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(FastLSTMSequence);
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(
+      const std::vector<array>& inputs) override {
+    int B = inputs[2].shape(0);
+    int T = inputs[0].shape(1);
+    int H = inputs[2].shape(1);
+    return {{B, T, H}, {B, T, H}};
+  }
+  auto state() const {
+    return std::make_tuple(nullptr);
+  }
+};
+
+// Full-sequence GRU: loops T timesteps in C++.
+class FastGRUSequence : public Custom {
+ public:
+  explicit FastGRUSequence(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback)
+      : Custom(stream, std::move(fallback)) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(FastGRUSequence);
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(
+      const std::vector<array>& inputs) override {
+    int B = inputs[2].shape(0);
+    int T = inputs[0].shape(1);
+    int H = inputs[2].shape(1);
+    return {{B, T, H}};
+  }
+  auto state() const {
+    return std::make_tuple(nullptr);
+  }
+};
 
 class ConvertFP8 : public Primitive {
  public:
