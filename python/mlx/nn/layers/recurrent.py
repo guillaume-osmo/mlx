@@ -1,11 +1,25 @@
 # Copyright © 2024 Apple Inc.
 
 import math
+import os
 from typing import Callable, Optional
 
 import mlx.core as mx
 from mlx.nn.layers.activations import tanh
 from mlx.nn.layers.base import Module
+
+# Versioned RNN implementation: set MLX_RNN_IMPL to revert or try improvements.
+# - "legacy": Python-only GRU/LSTM (no Metal fast_cell); use to compare or revert.
+# - "fast": Use mx.fast.gru_cell / mx.fast.lstm_cell when available (default).
+# - "fast_v2": Same as fast; reserved for future (e.g. precomputed input projection layout).
+_RNN_IMPL = os.environ.get("MLX_RNN_IMPL", "fast").strip().lower()
+if _RNN_IMPL not in ("legacy", "fast", "fast_v2"):
+    _RNN_IMPL = "fast"
+
+
+def get_rnn_implementation() -> str:
+    """Return current RNN implementation mode: 'legacy', 'fast', or 'fast_v2'."""
+    return _RNN_IMPL
 
 
 class RNN(Module):
@@ -159,12 +173,38 @@ class GRU(Module):
         else:
             x = x @ self.Wx.T
 
+        # Full-sequence path: eliminates Python loop overhead.
+        # Only used when hidden is explicitly provided. When hidden=None,
+        # the legacy first-timestep semantics differ (no bhn applied).
+        if (
+            _RNN_IMPL != "legacy"
+            and hasattr(mx.fast, "gru_sequence")
+            and mx.default_device() == mx.gpu
+            and x.ndim == 3
+            and hidden is not None
+        ):
+            return mx.fast.gru_sequence(x, self.Wh, hidden, bhn=self.bhn)
+
         x_rz = x[..., : -self.hidden_size]
         x_n = x[..., -self.hidden_size :]
-
         all_hidden = []
+        use_fast_cell = (
+            _RNN_IMPL != "legacy"
+            and hasattr(mx.fast, "gru_cell")
+            and mx.default_device() == mx.gpu
+            and x.ndim == 3
+        )
 
         for idx in range(x.shape[-2]):
+            if hidden is not None and use_fast_cell:
+                input_proj = x[..., idx, :]
+                h_proj = hidden @ self.Wh.T
+                hidden = mx.fast.gru_cell(
+                    input_proj, h_proj, hidden, bhn=self.bhn
+                )
+                all_hidden.append(hidden)
+                continue
+
             rz = x_rz[..., idx, :]
             if hidden is not None:
                 h_proj = hidden @ self.Wh.T
@@ -196,6 +236,149 @@ class GRU(Module):
             all_hidden.append(hidden)
 
         return mx.stack(all_hidden, axis=-2)
+
+
+class GRUResetAfter(Module):
+    r"""Keras-compatible GRU with reset-after formulation (exact gate math).
+
+    Matches TensorFlow/Keras `layers.GRU(reset_after=True)` numerics:
+    - Gate order stored as [update, reset, new]
+    - Separate input/recurrent biases (``b_i``, ``b_r``)
+    - Candidate computed as ``tanh(x_h + r * (h @ U_h + b_{rh}))``
+
+    Args:
+        input_size (int): Dimension of the input, ``D``.
+        hidden_size (int): Dimension of the hidden state, ``H``.
+        bias (bool): Whether to use biases. Default: ``True``.
+    """
+
+    def __init__(self, input_size: int, hidden_size: int, bias: bool = True):
+        super().__init__()
+        self.hidden_size = hidden_size
+
+        scale = 1.0 / math.sqrt(hidden_size)
+        # Store weights in Keras layout: (input_dim, 3 * hidden_size)
+        self.W = mx.random.uniform(
+            low=-scale, high=scale, shape=(input_size, 3 * hidden_size)
+        )
+        self.U = mx.random.uniform(
+            low=-scale, high=scale, shape=(hidden_size, 3 * hidden_size)
+        )
+
+        if bias:
+            self.b_i = mx.random.uniform(
+                low=-scale, high=scale, shape=(3 * hidden_size,)
+            )
+            self.b_r = mx.random.uniform(
+                low=-scale, high=scale, shape=(3 * hidden_size,)
+            )
+        else:
+            self.b_i = None
+            self.b_r = None
+
+    def _extra_repr(self):
+        return (
+            f"input_dims={self.W.shape[0]}, "
+            f"hidden_size={self.hidden_size}, bias={self.b_i is not None}"
+        )
+
+    def __call__(self, x, hidden=None):
+        squeeze_batch = False
+        if x.ndim == 2:
+            x = mx.expand_dims(x, axis=0)
+            squeeze_batch = True
+
+        if x.ndim != 3:
+            raise ValueError(
+                f"Expected input of shape (batch, seq, input), got {x.shape}"
+            )
+
+        batch_size, seq_len, input_dim = x.shape
+        if input_dim != self.W.shape[0]:
+            raise ValueError(
+                f"Input dim mismatch: expected {self.W.shape[0]}, got {input_dim}"
+            )
+
+        if hidden is None:
+            hidden = mx.zeros((batch_size, self.hidden_size), dtype=x.dtype)
+        else:
+            if hidden.ndim == 1:
+                hidden = mx.expand_dims(hidden, axis=0)
+            if hidden.shape[0] != batch_size:
+                raise ValueError(
+                    f"Hidden batch {hidden.shape[0]} != input batch {batch_size}"
+                )
+
+        x_flat = mx.reshape(x, (-1, input_dim))
+        x_proj = mx.matmul(x_flat, self.W)
+        if self.b_i is not None:
+            x_proj = x_proj + self.b_i
+        x_proj = mx.reshape(x_proj, (batch_size, seq_len, 3 * self.hidden_size))
+
+        H = self.hidden_size
+        use_fast_cell = (
+            _RNN_IMPL != "legacy"
+            and hasattr(mx.fast, "gru_cell")
+            and mx.default_device() == mx.gpu
+        )
+
+        outputs = []
+        if use_fast_cell:
+            # gru_cell expects gate order [r, z, n] but Keras stores [z, r, h].
+            # Reorder input/recurrent projections: swap first two H-wide blocks.
+            x_z = x_proj[..., :H]
+            x_r = x_proj[..., H : 2 * H]
+            x_h = x_proj[..., 2 * H :]
+            x_reordered = mx.concatenate([x_r, x_z, x_h], axis=-1)
+
+            U_z = self.U[:, :H]
+            U_r = self.U[:, H : 2 * H]
+            U_h = self.U[:, 2 * H :]
+            U_reordered = mx.concatenate([U_r, U_z, U_h], axis=-1)
+
+            bhn = None
+            if self.b_r is not None:
+                b_z = self.b_r[:H]
+                b_r = self.b_r[H : 2 * H]
+                b_h = self.b_r[2 * H :]
+                b_rz_reordered = mx.concatenate([b_r, b_z], axis=-1)
+                bhn = b_h
+            else:
+                b_rz_reordered = None
+
+            for t in range(seq_len):
+                input_proj_t = x_reordered[:, t, :]
+                h_proj = mx.matmul(hidden, U_reordered)
+                # Add recurrent bias for r/z gates; n-gate bias handled by bhn.
+                if b_rz_reordered is not None:
+                    h_rz = h_proj[..., : 2 * H] + b_rz_reordered
+                    h_n = h_proj[..., 2 * H :]
+                    h_proj = mx.concatenate([h_rz, h_n], axis=-1)
+                hidden = mx.fast.gru_cell(
+                    input_proj_t, h_proj, hidden, bhn=bhn
+                )
+                outputs.append(hidden)
+        else:
+            for t in range(seq_len):
+                x_t = x_proj[:, t, :]
+                x_z, x_r, x_h = mx.split(x_t, 3, axis=-1)
+
+                h_proj = mx.matmul(hidden, self.U)
+                if self.b_r is not None:
+                    h_proj = h_proj + self.b_r
+                h_z, h_r, h_h = mx.split(h_proj, 3, axis=-1)
+
+                z = mx.sigmoid(x_z + h_z)
+                r = mx.sigmoid(x_r + h_r)
+                n = mx.tanh(x_h + r * h_h)
+
+                hidden = (1.0 - z) * n + z * hidden
+                outputs.append(hidden)
+
+        out = mx.stack(outputs, axis=1)
+        if squeeze_batch:
+            out = mx.squeeze(out, axis=0)
+        return out
 
 
 class LSTM(Module):
@@ -265,11 +448,49 @@ class LSTM(Module):
         else:
             x = x @ self.Wx.T
 
+        # Full-sequence path: eliminates Python loop overhead.
+        if (
+            _RNN_IMPL != "legacy"
+            and hasattr(mx.fast, "lstm_sequence")
+            and mx.default_device() == mx.gpu
+            and x.ndim == 3
+        ):
+            if hidden is None:
+                hidden = mx.zeros(
+                    (x.shape[0], self.hidden_size), dtype=x.dtype
+                )
+            if cell is None:
+                cell = mx.zeros(
+                    (x.shape[0], self.hidden_size), dtype=x.dtype
+                )
+            return mx.fast.lstm_sequence(x, self.Wh, hidden, cell)
+
         all_hidden = []
         all_cell = []
+        use_fast_cell = (
+            _RNN_IMPL != "legacy"
+            and hasattr(mx.fast, "lstm_cell")
+            and mx.default_device() == mx.gpu
+            and x.ndim == 3
+        )
+
+        if use_fast_cell and hidden is None:
+            hidden = mx.zeros((x.shape[0], self.hidden_size), dtype=x.dtype)
+        if use_fast_cell and cell is None:
+            cell = mx.zeros((x.shape[0], self.hidden_size), dtype=x.dtype)
 
         for idx in range(x.shape[-2]):
-            ifgo = x[..., idx, :]
+            input_proj = x[..., idx, :]
+            if hidden is not None and cell is not None and use_fast_cell:
+                hidden_proj = hidden @ self.Wh.T
+                cell, hidden = mx.fast.lstm_cell(
+                    input_proj, hidden_proj, cell, hidden
+                )
+                all_cell.append(cell)
+                all_hidden.append(hidden)
+                continue
+
+            ifgo = input_proj
             if hidden is not None:
                 ifgo = mx.addmm(ifgo, hidden, self.Wh.T)
             i, f, g, o = mx.split(ifgo, 4, axis=-1)

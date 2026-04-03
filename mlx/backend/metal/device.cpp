@@ -33,9 +33,9 @@ constexpr const char* default_mtllib_path = METAL_PATH;
 
 auto get_metal_version() {
   auto get_metal_version_ = []() {
-    if (__builtin_available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)) {
+    if (__builtin_available(macOS 26, *)) {
       return MTL::LanguageVersion4_0;
-    } else if (__builtin_available(macOS 15, iOS 18, tvOS 18, visionOS 2, *)) {
+    } else if (__builtin_available(macOS 15, *)) {
       return MTL::LanguageVersion3_2;
     } else {
       return MTL::LanguageVersion3_1;

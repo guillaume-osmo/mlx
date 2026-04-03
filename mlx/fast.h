@@ -202,6 +202,58 @@ MLX_API array turboquant_decode_attention_prod_model_batched(
     const array& value_rotation,
     StreamOrDevice s = {});
 
+/** Fused GRU cell (Metal RNN). One step: out = (1-z)*n + z*h_prev with r,z,n
+ * from gates. */
+MLX_API array gru_cell(
+    const array& input_proj,
+    const array& hidden_proj,
+    const array& hidden_prev,
+    StreamOrDevice s = {});
+
+/** Same with optional recurrent bias bhn [H] for n-gate; avoids per-step add in Python. */
+MLX_API array gru_cell(
+    const array& input_proj,
+    const array& hidden_proj,
+    const array& hidden_prev,
+    const std::optional<array>& bhn,
+    StreamOrDevice s = {});
+
+/** Fused LSTM cell (Metal RNN). One step: cell_new = f*c_prev + i*g, hidden_new = o*tanh(cell_new). */
+MLX_API std::pair<array, array> lstm_cell(
+    const array& input_proj,
+    const array& hidden_proj,
+    const array& cell_prev,
+    const array& hidden_prev,
+    StreamOrDevice s = {});
+
+/** Full-sequence LSTM: loops T timesteps in C++ to avoid Python overhead.
+ *  input_proj: [B, T, 4H] (precomputed x @ Wx.T + bias)
+ *  Wh: [4H, H] (hidden-to-hidden weights, transposed)
+ *  h_init: [B, H] (initial hidden state)
+ *  c_init: [B, H] (initial cell state)
+ *  Returns: (h_out [B, T, H], c_out [B, T, H])
+ */
+MLX_API std::pair<array, array> lstm_sequence(
+    const array& input_proj,
+    const array& Wh,
+    const array& h_init,
+    const array& c_init,
+    StreamOrDevice s = {});
+
+/** Full-sequence GRU: loops T timesteps in C++ to avoid Python overhead.
+ *  input_proj: [B, T, 3H] (precomputed x @ Wx.T + bias)
+ *  Wh: [3H, H] (hidden-to-hidden weights, transposed)
+ *  h_init: [B, H] (initial hidden state)
+ *  bhn: optional [H] (recurrent bias for n-gate)
+ *  Returns: h_out [B, T, H]
+ */
+MLX_API array gru_sequence(
+    const array& input_proj,
+    const array& Wh,
+    const array& h_init,
+    const std::optional<array>& bhn = std::nullopt,
+    StreamOrDevice s = {});
+
 using TemplateArg = std::variant<int, bool, Dtype>;
 using ScalarArg = std::variant<bool, int, float>;
 

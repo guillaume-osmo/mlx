@@ -113,6 +113,9 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/event.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/eval.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/fast_turboquant_qk.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/fast_gru_cell.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/fast_lstm_cell.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/fast_rnn_sequence.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/fence.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/fft.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/hadamard.cpp

@@ -694,6 +694,107 @@ void init_fast(nb::module_& parent_module) {
 
 
   m.def(
+      "gru_cell",
+      [](const mx::array& input_proj,
+         const mx::array& hidden_proj,
+         const mx::array& hidden_prev,
+         nb::object bhn,
+         mx::StreamOrDevice s) {
+        if (bhn.is_none()) {
+          return mx::fast::gru_cell(input_proj, hidden_proj, hidden_prev, s);
+        }
+        std::optional<mx::array> bhn_opt = nb::cast<mx::array>(bhn);
+        return mx::fast::gru_cell(
+            input_proj, hidden_proj, hidden_prev, bhn_opt, s);
+      },
+      "input_proj"_a,
+      "hidden_proj"_a,
+      "hidden_prev"_a,
+      "bhn"_a = nb::none(),
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def gru_cell(input_proj: array, hidden_proj: array, hidden_prev: array, "
+          "bhn: Optional[array] = None, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Fused GRU cell (Metal RNN). One step: out = (1-z)*n + z*h_prev with r,z,n from gates.
+        input_proj [B, 3*H], hidden_proj [B, 3*H], hidden_prev [B, H]. Optional bhn [H] for n-gate
+        (avoids per-step add in Python). Uses Metal kernel on Apple Silicon.
+      )pbdoc");
+
+  m.def(
+      "lstm_cell",
+      [](const mx::array& input_proj,
+         const mx::array& hidden_proj,
+         const mx::array& cell_prev,
+         const mx::array& hidden_prev,
+         mx::StreamOrDevice s) {
+        auto [c_new, h_new] = mx::fast::lstm_cell(
+            input_proj, hidden_proj, cell_prev, hidden_prev, s);
+        return nb::make_tuple(c_new, h_new);
+      },
+      "input_proj"_a,
+      "hidden_proj"_a,
+      "cell_prev"_a,
+      "hidden_prev"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def lstm_cell(input_proj: array, hidden_proj: array, cell_prev: array, hidden_prev: array, *, stream: Union[None, Stream, Device] = None) -> Tuple[array, array]"),
+      R"pbdoc(
+        Fused LSTM cell (Metal RNN). One step: cell_new = f*c_prev + i*g, hidden_new = o*tanh(cell_new).
+        Returns (cell_new, hidden_new). Uses Metal kernel on Apple Silicon.
+      )pbdoc");
+
+  m.def(
+      "lstm_sequence",
+      [](const mx::array& input_proj,
+         const mx::array& Wh,
+         const mx::array& h_init,
+         const mx::array& c_init,
+         mx::StreamOrDevice s) {
+        auto [h_out, c_out] = mx::fast::lstm_sequence(
+            input_proj, Wh, h_init, c_init, s);
+        return nb::make_tuple(h_out, c_out);
+      },
+      "input_proj"_a,
+      "Wh"_a,
+      "h_init"_a,
+      "c_init"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def lstm_sequence(input_proj: array, Wh: array, h_init: array, c_init: array, *, stream: Union[None, Stream, Device] = None) -> Tuple[array, array]"),
+      R"pbdoc(
+        Full-sequence LSTM. Loops T timesteps in C++ to avoid Python overhead.
+        input_proj: [B, T, 4H], Wh: [4H, H], h_init: [B, H], c_init: [B, H].
+        Returns (h_out [B, T, H], c_out [B, T, H]).
+      )pbdoc");
+
+  m.def(
+      "gru_sequence",
+      [](const mx::array& input_proj,
+         const mx::array& Wh,
+         const mx::array& h_init,
+         std::optional<mx::array> bhn,
+         mx::StreamOrDevice s) {
+        return mx::fast::gru_sequence(input_proj, Wh, h_init, bhn, s);
+      },
+      "input_proj"_a,
+      "Wh"_a,
+      "h_init"_a,
+      "bhn"_a = nb::none(),
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def gru_sequence(input_proj: array, Wh: array, h_init: array, bhn: Optional[array] = None, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Full-sequence GRU. Loops T timesteps in C++ to avoid Python overhead.
+        input_proj: [B, T, 3H], Wh: [3H, H], h_init: [B, H], bhn: optional [H].
+        Returns h_out [B, T, H].
+      )pbdoc");
+
+  m.def(
       "metal_kernel",
       [](const std::string& name,
          const std::vector<std::string>& input_names,

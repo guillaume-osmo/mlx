@@ -446,6 +446,12 @@ struct PrimitiveFactory {
       SERIALIZE_PRIMITIVE(LayerNormVJP),
       SERIALIZE_PRIMITIVE(RoPE),
       SERIALIZE_PRIMITIVE(ScaledDotProductAttention),
+      SERIALIZE_PRIMITIVE(FastGruCell),
+      SERIALIZE_PRIMITIVE(FastGruCellVJP),
+      SERIALIZE_PRIMITIVE(FastGRUSequence),
+      SERIALIZE_PRIMITIVE(FastLSTMCell),
+      SERIALIZE_PRIMITIVE(FastLSTMCellVJP),
+      SERIALIZE_PRIMITIVE(FastLSTMSequence),
       SERIALIZE_PRIMITIVE(CustomKernel)};
   std::unordered_map<std::string, std::string> name_remap;
   std::unordered_map<int, Stream> stream_map;
