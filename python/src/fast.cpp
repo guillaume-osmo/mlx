@@ -747,6 +747,54 @@ void init_fast(nb::module_& parent_module) {
       )pbdoc");
 
   m.def(
+      "lstm_sequence",
+      [](const mx::array& input_proj,
+         const mx::array& Wh,
+         const mx::array& h_init,
+         const mx::array& c_init,
+         mx::StreamOrDevice s) {
+        auto [h_out, c_out] = mx::fast::lstm_sequence(
+            input_proj, Wh, h_init, c_init, s);
+        return nb::make_tuple(h_out, c_out);
+      },
+      "input_proj"_a,
+      "Wh"_a,
+      "h_init"_a,
+      "c_init"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def lstm_sequence(input_proj: array, Wh: array, h_init: array, c_init: array, *, stream: Union[None, Stream, Device] = None) -> Tuple[array, array]"),
+      R"pbdoc(
+        Full-sequence LSTM. Loops T timesteps in C++ to avoid Python overhead.
+        input_proj: [B, T, 4H], Wh: [4H, H], h_init: [B, H], c_init: [B, H].
+        Returns (h_out [B, T, H], c_out [B, T, H]).
+      )pbdoc");
+
+  m.def(
+      "gru_sequence",
+      [](const mx::array& input_proj,
+         const mx::array& Wh,
+         const mx::array& h_init,
+         std::optional<mx::array> bhn,
+         mx::StreamOrDevice s) {
+        return mx::fast::gru_sequence(input_proj, Wh, h_init, bhn, s);
+      },
+      "input_proj"_a,
+      "Wh"_a,
+      "h_init"_a,
+      "bhn"_a = nb::none(),
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def gru_sequence(input_proj: array, Wh: array, h_init: array, bhn: Optional[array] = None, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Full-sequence GRU. Loops T timesteps in C++ to avoid Python overhead.
+        input_proj: [B, T, 3H], Wh: [3H, H], h_init: [B, H], bhn: optional [H].
+        Returns h_out [B, T, H].
+      )pbdoc");
+
+  m.def(
       "metal_kernel",
       [](const std::string& name,
          const std::vector<std::string>& input_names,

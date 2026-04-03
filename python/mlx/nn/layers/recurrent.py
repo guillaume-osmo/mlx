@@ -173,22 +173,35 @@ class GRU(Module):
         else:
             x = x @ self.Wx.T
 
+        # Full-sequence path: eliminates Python loop overhead.
+        # Only used when hidden is explicitly provided. When hidden=None,
+        # the legacy first-timestep semantics differ (no bhn applied).
+        if (
+            _RNN_IMPL != "legacy"
+            and hasattr(mx.fast, "gru_sequence")
+            and mx.default_device() == mx.gpu
+            and x.ndim == 3
+            and hidden is not None
+        ):
+            return mx.fast.gru_sequence(x, self.Wh, hidden, bhn=self.bhn)
+
         x_rz = x[..., : -self.hidden_size]
         x_n = x[..., -self.hidden_size :]
         all_hidden = []
-        # legacy = Python-only; fast / fast_v2 = use Metal kernel when on GPU only
         use_fast_cell = (
             _RNN_IMPL != "legacy"
             and hasattr(mx.fast, "gru_cell")
             and mx.default_device() == mx.gpu
+            and x.ndim == 3
         )
+
         for idx in range(x.shape[-2]):
-            # Metal-accelerated path (GRUCell-style): fused kernel when hidden is set.
-            # Pass bhn to kernel when bias is used so h_proj stays contiguous (no per-step copy).
             if hidden is not None and use_fast_cell:
                 input_proj = x[..., idx, :]
                 h_proj = hidden @ self.Wh.T
-                hidden = mx.fast.gru_cell(input_proj, h_proj, hidden, bhn=self.bhn)
+                hidden = mx.fast.gru_cell(
+                    input_proj, h_proj, hidden, bhn=self.bhn
+                )
                 all_hidden.append(hidden)
                 continue
 
@@ -302,22 +315,65 @@ class GRUResetAfter(Module):
             x_proj = x_proj + self.b_i
         x_proj = mx.reshape(x_proj, (batch_size, seq_len, 3 * self.hidden_size))
 
+        H = self.hidden_size
+        use_fast_cell = (
+            _RNN_IMPL != "legacy"
+            and hasattr(mx.fast, "gru_cell")
+            and mx.default_device() == mx.gpu
+        )
+
         outputs = []
-        for t in range(seq_len):
-            x_t = x_proj[:, t, :]
-            x_z, x_r, x_h = mx.split(x_t, 3, axis=-1)
+        if use_fast_cell:
+            # gru_cell expects gate order [r, z, n] but Keras stores [z, r, h].
+            # Reorder input/recurrent projections: swap first two H-wide blocks.
+            x_z = x_proj[..., :H]
+            x_r = x_proj[..., H : 2 * H]
+            x_h = x_proj[..., 2 * H :]
+            x_reordered = mx.concatenate([x_r, x_z, x_h], axis=-1)
 
-            h_proj = mx.matmul(hidden, self.U)
+            U_z = self.U[:, :H]
+            U_r = self.U[:, H : 2 * H]
+            U_h = self.U[:, 2 * H :]
+            U_reordered = mx.concatenate([U_r, U_z, U_h], axis=-1)
+
+            bhn = None
             if self.b_r is not None:
-                h_proj = h_proj + self.b_r
-            h_z, h_r, h_h = mx.split(h_proj, 3, axis=-1)
+                b_z = self.b_r[:H]
+                b_r = self.b_r[H : 2 * H]
+                b_h = self.b_r[2 * H :]
+                b_rz_reordered = mx.concatenate([b_r, b_z], axis=-1)
+                bhn = b_h
+            else:
+                b_rz_reordered = None
 
-            z = mx.sigmoid(x_z + h_z)
-            r = mx.sigmoid(x_r + h_r)
-            n = mx.tanh(x_h + r * h_h)
+            for t in range(seq_len):
+                input_proj_t = x_reordered[:, t, :]
+                h_proj = mx.matmul(hidden, U_reordered)
+                # Add recurrent bias for r/z gates; n-gate bias handled by bhn.
+                if b_rz_reordered is not None:
+                    h_rz = h_proj[..., : 2 * H] + b_rz_reordered
+                    h_n = h_proj[..., 2 * H :]
+                    h_proj = mx.concatenate([h_rz, h_n], axis=-1)
+                hidden = mx.fast.gru_cell(
+                    input_proj_t, h_proj, hidden, bhn=bhn
+                )
+                outputs.append(hidden)
+        else:
+            for t in range(seq_len):
+                x_t = x_proj[:, t, :]
+                x_z, x_r, x_h = mx.split(x_t, 3, axis=-1)
 
-            hidden = (1.0 - z) * n + z * hidden
-            outputs.append(hidden)
+                h_proj = mx.matmul(hidden, self.U)
+                if self.b_r is not None:
+                    h_proj = h_proj + self.b_r
+                h_z, h_r, h_h = mx.split(h_proj, 3, axis=-1)
+
+                z = mx.sigmoid(x_z + h_z)
+                r = mx.sigmoid(x_r + h_r)
+                n = mx.tanh(x_h + r * h_h)
+
+                hidden = (1.0 - z) * n + z * hidden
+                outputs.append(hidden)
 
         out = mx.stack(outputs, axis=1)
         if squeeze_batch:
@@ -392,20 +448,44 @@ class LSTM(Module):
         else:
             x = x @ self.Wx.T
 
+        # Full-sequence path: eliminates Python loop overhead.
+        if (
+            _RNN_IMPL != "legacy"
+            and hasattr(mx.fast, "lstm_sequence")
+            and mx.default_device() == mx.gpu
+            and x.ndim == 3
+        ):
+            if hidden is None:
+                hidden = mx.zeros(
+                    (x.shape[0], self.hidden_size), dtype=x.dtype
+                )
+            if cell is None:
+                cell = mx.zeros(
+                    (x.shape[0], self.hidden_size), dtype=x.dtype
+                )
+            return mx.fast.lstm_sequence(x, self.Wh, hidden, cell)
+
         all_hidden = []
         all_cell = []
-        # legacy = Python-only; fast / fast_v2 = use Metal kernel when on GPU only
         use_fast_cell = (
             _RNN_IMPL != "legacy"
             and hasattr(mx.fast, "lstm_cell")
             and mx.default_device() == mx.gpu
+            and x.ndim == 3
         )
+
+        if use_fast_cell and hidden is None:
+            hidden = mx.zeros((x.shape[0], self.hidden_size), dtype=x.dtype)
+        if use_fast_cell and cell is None:
+            cell = mx.zeros((x.shape[0], self.hidden_size), dtype=x.dtype)
 
         for idx in range(x.shape[-2]):
             input_proj = x[..., idx, :]
             if hidden is not None and cell is not None and use_fast_cell:
                 hidden_proj = hidden @ self.Wh.T
-                cell, hidden = mx.fast.lstm_cell(input_proj, hidden_proj, cell, hidden)
+                cell, hidden = mx.fast.lstm_cell(
+                    input_proj, hidden_proj, cell, hidden
+                )
                 all_cell.append(cell)
                 all_hidden.append(hidden)
                 continue

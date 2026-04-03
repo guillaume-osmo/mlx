@@ -1,7 +1,9 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <numeric>
+#include <string>
 
 #include "mlx/fast.h"
 #include "mlx/fast_primitives.h"
@@ -55,6 +57,17 @@ namespace {
 
 bool is_fast_rnn_dtype(Dtype t) {
   return t == float32 || t == bfloat16;
+}
+
+bool use_fast_v2_sequence_primitive() {
+  static const bool enabled = []() {
+    const char* impl = std::getenv("MLX_RNN_IMPL");
+    if (impl == nullptr) {
+      return false;
+    }
+    return std::string(impl) == "fast_v2";
+  }();
+  return enabled;
 }
 
 std::vector<array> normalize_fast_rnn_inputs(
@@ -2097,6 +2110,152 @@ std::vector<array> FastLSTMCell::vjp(
         "[lstm_cell] Unsupported VJP argnum. Valid argnums are 0,1,2,3.");
   }
   return returned_vjps;
+}
+
+// ---------- Full-sequence LSTM ----------
+
+std::pair<array, array> lstm_sequence(
+    const array& input_proj,
+    const array& Wh,
+    const array& h_init,
+    const array& c_init,
+    StreamOrDevice s_ /* = {} */) {
+  auto s = to_stream(s_);
+  if (input_proj.ndim() != 3) {
+    throw std::invalid_argument(
+        "[lstm_sequence] input_proj must be 3D [B, T, 4H].");
+  }
+  if (Wh.ndim() != 2) {
+    throw std::invalid_argument(
+        "[lstm_sequence] Wh must be 2D [4H, H].");
+  }
+  if (h_init.ndim() != 2 || c_init.ndim() != 2) {
+    throw std::invalid_argument(
+        "[lstm_sequence] h_init and c_init must be 2D [B, H].");
+  }
+  int B = input_proj.shape(0);
+  int T = input_proj.shape(1);
+  int H4 = input_proj.shape(2);
+  if (H4 % 4 != 0) {
+    throw std::invalid_argument(
+        "[lstm_sequence] input_proj last dim must be 4*H.");
+  }
+  int H = H4 / 4;
+  if (Wh.shape(0) != H4 || Wh.shape(1) != H) {
+    throw std::invalid_argument(
+        "[lstm_sequence] Wh shape must be [4H, H].");
+  }
+  if (h_init.shape(0) != B || h_init.shape(1) != H ||
+      c_init.shape(0) != B || c_init.shape(1) != H) {
+    throw std::invalid_argument(
+        "[lstm_sequence] h_init/c_init shape must be [B, H].");
+  }
+
+  auto fallback = [s, T, B, H4](const std::vector<array>& inputs) {
+    const array& x_seq = inputs[0];
+    const array& wh = inputs[1];
+    array h = inputs[2], c = inputs[3];
+    std::vector<array> all_h, all_c;
+    all_h.reserve(T);
+    all_c.reserve(T);
+    array wh_t = transpose(wh, {1, 0}, s);
+    for (int t = 0; t < T; ++t) {
+      array x_t = reshape(
+          slice(x_seq, {0, t, 0}, {B, t + 1, H4}, s), {B, H4}, s);
+      array h_proj = matmul(h, wh_t, s);
+      auto [c_new, h_new] = lstm_cell(x_t, h_proj, c, h, s);
+      c = c_new;
+      h = h_new;
+      all_h.push_back(h);
+      all_c.push_back(c);
+    }
+    return std::vector<array>{stack(all_h, 1, s), stack(all_c, 1, s)};
+  };
+
+  // Check if we can use the fused simdgroup_matrix kernel.
+  // Requirements: H % 8 == 0, float32, and TG memory fits at B_TILE=8.
+  // TG memory: 8 * H * sizeof(float) + 8 * 4H * sizeof(float) = 160H bytes
+  constexpr int MAX_H_FUSED = 204; // 160 * 204 = 32640 < 32768
+  bool can_fuse_gpu = use_fast_v2_sequence_primitive() &&
+      (H % 8 == 0) && (H <= MAX_H_FUSED) &&
+      input_proj.dtype() == float32 && Wh.dtype() == float32 &&
+      h_init.dtype() == float32 && c_init.dtype() == float32;
+
+  if (!can_fuse_gpu) {
+    auto outputs = fallback({input_proj, Wh, h_init, c_init});
+    return std::make_pair(std::move(outputs[0]), std::move(outputs[1]));
+  }
+
+  // Fused persistent kernel: single Metal dispatch for all T timesteps.
+  {
+    Shape out_shape{B, T, H};
+    auto primitive = std::make_shared<FastLSTMSequence>(s, std::move(fallback));
+    auto outputs = array::make_arrays(
+        {out_shape, out_shape},
+        {input_proj.dtype(), input_proj.dtype()},
+        primitive,
+        {input_proj, Wh, h_init, c_init});
+    return std::make_pair(std::move(outputs[0]), std::move(outputs[1]));
+  }
+}
+
+// ---------- Full-sequence GRU ----------
+
+array gru_sequence(
+    const array& input_proj,
+    const array& Wh,
+    const array& h_init,
+    const std::optional<array>& bhn,
+    StreamOrDevice s_ /* = {} */) {
+  auto s = to_stream(s_);
+  if (input_proj.ndim() != 3) {
+    throw std::invalid_argument(
+        "[gru_sequence] input_proj must be 3D [B, T, 3H].");
+  }
+  if (Wh.ndim() != 2) {
+    throw std::invalid_argument(
+        "[gru_sequence] Wh must be 2D [3H, H].");
+  }
+  if (h_init.ndim() != 2) {
+    throw std::invalid_argument(
+        "[gru_sequence] h_init must be 2D [B, H].");
+  }
+  int B = input_proj.shape(0);
+  int T = input_proj.shape(1);
+  int H3 = input_proj.shape(2);
+  if (H3 % 3 != 0) {
+    throw std::invalid_argument(
+        "[gru_sequence] input_proj last dim must be 3*H.");
+  }
+  int H = H3 / 3;
+  if (Wh.shape(0) != H3 || Wh.shape(1) != H) {
+    throw std::invalid_argument(
+        "[gru_sequence] Wh shape must be [3H, H].");
+  }
+  if (h_init.shape(0) != B || h_init.shape(1) != H) {
+    throw std::invalid_argument(
+        "[gru_sequence] h_init shape must be [B, H].");
+  }
+  if (bhn.has_value()) {
+    if (bhn->ndim() != 1 || bhn->shape(0) != H) {
+      throw std::invalid_argument(
+          "[gru_sequence] bhn must be 1D of length H.");
+    }
+  }
+
+  // Direct graph building — same as LSTM approach above.
+  array h = h_init;
+  std::vector<array> all_h;
+  all_h.reserve(T);
+  array wh_t = transpose(Wh, {1, 0}, s);
+  for (int t = 0; t < T; ++t) {
+    array x_t = reshape(
+        slice(input_proj, {0, t, 0}, {B, t + 1, H3}, s), {B, H3}, s);
+    array h_proj = matmul(h, wh_t, s);
+    h = gru_cell(x_t, h_proj, h, bhn, s);
+    all_h.push_back(h);
+  }
+  return stack(all_h, 1, s);
 }
 
 std::vector<array> ScaledDotProductAttention::vjp(

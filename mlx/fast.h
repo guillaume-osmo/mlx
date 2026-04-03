@@ -226,6 +226,34 @@ MLX_API std::pair<array, array> lstm_cell(
     const array& hidden_prev,
     StreamOrDevice s = {});
 
+/** Full-sequence LSTM: loops T timesteps in C++ to avoid Python overhead.
+ *  input_proj: [B, T, 4H] (precomputed x @ Wx.T + bias)
+ *  Wh: [4H, H] (hidden-to-hidden weights, transposed)
+ *  h_init: [B, H] (initial hidden state)
+ *  c_init: [B, H] (initial cell state)
+ *  Returns: (h_out [B, T, H], c_out [B, T, H])
+ */
+MLX_API std::pair<array, array> lstm_sequence(
+    const array& input_proj,
+    const array& Wh,
+    const array& h_init,
+    const array& c_init,
+    StreamOrDevice s = {});
+
+/** Full-sequence GRU: loops T timesteps in C++ to avoid Python overhead.
+ *  input_proj: [B, T, 3H] (precomputed x @ Wx.T + bias)
+ *  Wh: [3H, H] (hidden-to-hidden weights, transposed)
+ *  h_init: [B, H] (initial hidden state)
+ *  bhn: optional [H] (recurrent bias for n-gate)
+ *  Returns: h_out [B, T, H]
+ */
+MLX_API array gru_sequence(
+    const array& input_proj,
+    const array& Wh,
+    const array& h_init,
+    const std::optional<array>& bhn = std::nullopt,
+    StreamOrDevice s = {});
+
 using TemplateArg = std::variant<int, bool, Dtype>;
 using ScalarArg = std::variant<bool, int, float>;
 
