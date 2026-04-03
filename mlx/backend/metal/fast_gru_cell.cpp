@@ -115,7 +115,7 @@ void FastGruCell::eval_gpu(
         : "gru_cell_fused_float";
   }
 
-  auto& enc = d.get_command_encoder(s.index);
+  auto& enc = metal::get_command_encoder(s);
   auto kernel = d.get_kernel(kname);
   enc.set_compute_pipeline_state(kernel);
 
@@ -147,7 +147,7 @@ void FastGruCell::eval_gpu(
   MTL::Size group_dims(threads_per_group, 1, 1);
   enc.dispatch_threadgroups(grid_dims, group_dims);
 
-  d.add_temporaries(std::move(copies), s.index);
+  enc.add_temporaries(std::move(copies));
 }
 
 bool FastGruCell::is_equivalent(const Primitive& other) const {
@@ -220,7 +220,7 @@ void FastGruCellVJP::eval_gpu(
     kname = "gru_cell_fused_float_vjp";
   }
 
-  auto& enc = d.get_command_encoder(s.index);
+  auto& enc = metal::get_command_encoder(s);
   auto kernel = d.get_kernel(kname);
   enc.set_compute_pipeline_state(kernel);
 
@@ -257,7 +257,7 @@ void FastGruCellVJP::eval_gpu(
   MTL::Size group_dims(threads_per_group, 1, 1);
   enc.dispatch_threadgroups(grid_dims, group_dims);
 
-  d.add_temporaries(std::move(copies), s.index);
+  enc.add_temporaries(std::move(copies));
 }
 
 bool FastGruCellVJP::is_equivalent(const Primitive& other) const {

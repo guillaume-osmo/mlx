@@ -142,7 +142,7 @@ void FastTurboQuantQK::eval_gpu(
     }
   }
 
-  auto& enc = d.get_command_encoder(s.index);
+  auto& enc = metal::get_command_encoder(s);
   auto kernel = d.get_kernel(kname);
   enc.set_compute_pipeline_state(kernel);
 
@@ -178,7 +178,7 @@ void FastTurboQuantQK::eval_gpu(
     enc.dispatch_threads(grid_dims, group_dims);
   }
 
-  d.add_temporaries(std::move(copies), s.index);
+  enc.add_temporaries(std::move(copies));
 }
 
 bool FastTurboQuantQK::is_equivalent(const Primitive& other) const {
@@ -336,7 +336,7 @@ void FastTurboQuantQKBatched::eval_gpu(
     }
   }
 
-  auto& enc = d.get_command_encoder(s.index);
+  auto& enc = metal::get_command_encoder(s);
   auto kernel = d.get_kernel(kname);
   enc.set_compute_pipeline_state(kernel);
 
@@ -380,7 +380,7 @@ void FastTurboQuantQKBatched::eval_gpu(
     enc.dispatch_threads(grid_dims, group_dims);
   }
 
-  d.add_temporaries(std::move(copies), s.index);
+  enc.add_temporaries(std::move(copies));
 }
 
 bool FastTurboQuantQKBatched::is_equivalent(const Primitive& other) const {
@@ -452,7 +452,7 @@ void FastTurboQuantQJLScoreBatched::eval_gpu(
   constexpr float kPi = 3.14159265358979323846f;
   float alpha = std::sqrt(kPi / 2.0f) / static_cast<float>(dim);
 
-  auto& enc = d.get_command_encoder(s.index);
+  auto& enc = metal::get_command_encoder(s);
   bool use_blocked = (dim <= 128u && token_count >= 128u);
   std::string kname =
       use_blocked ? "turboquant_qjl_score_batched_b8"
@@ -484,7 +484,7 @@ void FastTurboQuantQJLScoreBatched::eval_gpu(
   check_kernel_threadgroup_size(kernel, group_dims, kname);
   enc.dispatch_threads(grid_dims, group_dims);
 
-  d.add_temporaries(std::move(copies), s.index);
+  enc.add_temporaries(std::move(copies));
 }
 
 bool FastTurboQuantQJLScoreBatched::is_equivalent(const Primitive& other) const {
@@ -605,7 +605,7 @@ void FastTurboQuantAVBatched::eval_gpu(
     block_dims = (gen >= 14) ? 8 : 8;
   }
 
-  auto& enc = d.get_command_encoder(s.index);
+  auto& enc = metal::get_command_encoder(s);
   std::string kname = "turboquant_av_decode_batched_scalar";
   if (use_simd) {
     auto av_blocked_name = [&](int selected_unroll) {
@@ -655,7 +655,7 @@ void FastTurboQuantAVBatched::eval_gpu(
     enc.dispatch_threads(grid_dims, group_dims);
   }
 
-  d.add_temporaries(std::move(copies), s.index);
+  enc.add_temporaries(std::move(copies));
 }
 
 bool FastTurboQuantAVBatched::is_equivalent(const Primitive& other) const {
@@ -762,7 +762,7 @@ void FastTurboQuantDecodeAttentionBatched::eval_gpu(
     kname = "turboquant_decode_attention_batched_u2";
   }
 
-  auto& enc = d.get_command_encoder(s.index);
+  auto& enc = metal::get_command_encoder(s);
   auto kernel = d.get_kernel(kname);
   enc.set_compute_pipeline_state(kernel);
 
@@ -793,7 +793,7 @@ void FastTurboQuantDecodeAttentionBatched::eval_gpu(
   check_kernel_threadgroup_size(kernel, group_dims, kname);
   enc.dispatch_threads(grid_dims, group_dims);
 
-  d.add_temporaries(std::move(copies), s.index);
+  enc.add_temporaries(std::move(copies));
 }
 
 bool FastTurboQuantDecodeAttentionBatched::is_equivalent(

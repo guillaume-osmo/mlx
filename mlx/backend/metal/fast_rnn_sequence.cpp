@@ -121,7 +121,7 @@ void FastLSTMSequence::eval_gpu(
     uint32_t shared_h_bytes = b_tile_pad * hs * sizeof(uint16_t);
     uint32_t gate_buf_bytes = b_tile_pad * static_cast<uint32_t>(H4) * sizeof(float);
 
-    auto& enc = d.get_command_encoder(s.index);
+    auto& enc = metal::get_command_encoder(s);
     enc.set_compute_pipeline_state(kernel);
     enc.set_input_array(x, 0);
     enc.set_input_array(wh_t_bf, 1);
@@ -148,7 +148,7 @@ void FastLSTMSequence::eval_gpu(
     uint32_t shared_h_bytes = b_tile_pad * hs * sizeof(float);
     uint32_t gate_buf_bytes = b_tile_pad * static_cast<uint32_t>(H4) * sizeof(float);
 
-    auto& enc = d.get_command_encoder(s.index);
+    auto& enc = metal::get_command_encoder(s);
     enc.set_compute_pipeline_state(kernel);
     enc.set_input_array(x, 0);
     enc.set_input_array(wh_t, 1);
@@ -168,7 +168,7 @@ void FastLSTMSequence::eval_gpu(
         MTL::Size(threads_per_tg, 1, 1));
   }
 
-  d.add_temporaries(std::move(temps), s.index);
+  metal::get_command_encoder(s).add_temporaries(std::move(temps));
 }
 
 bool FastLSTMSequence::is_equivalent(const Primitive& other) const {

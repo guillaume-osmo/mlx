@@ -103,7 +103,7 @@ void FastLSTMCell::eval_gpu(
       ? "lstm_cell_fused_bfloat16"
       : "lstm_cell_fused_float";
 
-  auto& enc = d.get_command_encoder(s.index);
+  auto& enc = metal::get_command_encoder(s);
   auto kernel = d.get_kernel(kname);
   enc.set_compute_pipeline_state(kernel);
 
@@ -130,7 +130,7 @@ void FastLSTMCell::eval_gpu(
   MTL::Size group_dims(threads_per_group, 1, 1);
   enc.dispatch_threadgroups(grid_dims, group_dims);
 
-  d.add_temporaries(std::move(copies), s.index);
+  enc.add_temporaries(std::move(copies));
 }
 
 bool FastLSTMCell::is_equivalent(const Primitive& other) const {
@@ -192,7 +192,7 @@ void FastLSTMCellVJP::eval_gpu(
   uint32_t hs = static_cast<uint32_t>(hidden_size);
   uint32_t use_precise = parse_lstm_precise_math_env();
 
-  auto& enc = d.get_command_encoder(s.index);
+  auto& enc = metal::get_command_encoder(s);
   auto kernel = d.get_kernel("lstm_cell_fused_float_vjp");
   enc.set_compute_pipeline_state(kernel);
 
@@ -219,7 +219,7 @@ void FastLSTMCellVJP::eval_gpu(
   MTL::Size group_dims(threads_per_group, 1, 1);
   enc.dispatch_threadgroups(grid_dims, group_dims);
 
-  d.add_temporaries(std::move(copies), s.index);
+  enc.add_temporaries(std::move(copies));
 }
 
 bool FastLSTMCellVJP::is_equivalent(const Primitive& other) const {

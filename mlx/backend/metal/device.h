@@ -233,25 +233,6 @@ MLX_API CommandEncoder& get_command_encoder(Stream s);
 std::unordered_map<int, CommandEncoder>& get_command_encoders();
 NS::SharedPtr<NS::AutoreleasePool> new_scoped_memory_pool();
 
-inline bool is_nax_available() {
-#ifdef MLX_METAL_NO_NAX
-  return false;
-#else
-  auto _check_nax = []() {
-    bool can_use_nax = false;
-    if (__builtin_available(
-            macOS 26.2, *)) {
-      can_use_nax = true;
-    }
-    auto& d = metal::device(mlx::core::Device::gpu);
-    auto arch = d.get_architecture().back();
-    auto gen = d.get_architecture_gen();
-    can_use_nax &= gen >= (arch == 'p' ? 18 : 17);
-    return can_use_nax;
-  };
-  static bool is_nax_available_ = _check_nax();
-  return is_nax_available_;
-#endif
-}
+bool is_nax_available();
 
 } // namespace mlx::core::metal

@@ -42,7 +42,7 @@ void sdpa_turboquant_1pass(
   kname += "_" + std::to_string(params.mse_bits);
   kname += "_" + std::to_string(params.v_bits);
 
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = metal::get_command_encoder(s);
   auto kernel = d.get_kernel(kname);
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -116,11 +116,11 @@ void sdpa_turboquant_2pass(
   intermediate.set_data(allocator::malloc(intermediate.nbytes()));
   inter_sums.set_data(allocator::malloc(inter_sums.nbytes()));
   inter_maxs.set_data(allocator::malloc(inter_maxs.nbytes()));
-  d.add_temporary(intermediate, s.index);
-  d.add_temporary(inter_sums, s.index);
-  d.add_temporary(inter_maxs, s.index);
 
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.add_temporary(intermediate);
+  compute_encoder.add_temporary(inter_sums);
+  compute_encoder.add_temporary(inter_maxs);
   auto kernel1 = d.get_kernel(kname1);
   compute_encoder.set_compute_pipeline_state(kernel1);
 
@@ -286,7 +286,7 @@ void TurboQuantAttention::eval_gpu(
         D);
   }
 
-  d.add_temporaries(std::move(copies), s.index);
+  metal::get_command_encoder(s).add_temporaries(std::move(copies));
 }
 
 } // namespace mlx::core::fast
