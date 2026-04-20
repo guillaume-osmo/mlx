@@ -77,6 +77,36 @@ std::vector<array> normalize_fast_rnn_inputs(
 
 } // namespace
 
+array relu2(
+    const array& x,
+    StreamOrDevice s_ /* = {} */) {
+  if (!issubdtype(x.dtype(), floating)) {
+    std::ostringstream msg;
+    msg << "[relu2] Input must be a floating type but got " << x.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto s = to_stream(s_);
+  auto fallback = [s](const std::vector<array>& inputs) {
+    auto out = maximum(inputs[0], array(0, inputs[0].dtype()), s);
+    out = square(out, s);
+    return std::vector<array>{out};
+  };
+
+  if (s.device == Device::gpu) {
+    return array(
+        x.shape(),
+        x.dtype(),
+        std::make_shared<ReluSquared>(s, fallback),
+        {x});
+  }
+  return fallback({x})[0];
+}
+
+bool ReluSquared::is_equivalent(const Primitive& other) const {
+  return true;
+}
+
 array rms_norm(
     const array& x,
     const std::optional<array>& weight,
@@ -212,6 +242,100 @@ bool RMSNorm::is_equivalent(const Primitive& other) const {
 bool RMSNormVJP::is_equivalent(const Primitive& other) const {
   const RMSNormVJP& a_other = static_cast<const RMSNormVJP&>(other);
   return eps_ == a_other.eps_;
+}
+
+array rms_norm_linear(
+    const array& x,
+    const std::optional<array>& norm_weight,
+    const array& linear_weight,
+    const std::optional<array>& bias,
+    float eps,
+    bool weight_transposed,
+    StreamOrDevice s_ /* = {} */) {
+  const bool has_norm_weight = norm_weight.has_value();
+  const bool has_bias = bias.has_value();
+
+  if (x.ndim() == 0) {
+    throw std::invalid_argument(
+        "[rms_norm_linear] x must have at least 1 dimension.");
+  }
+  if (linear_weight.ndim() != 2) {
+    throw std::invalid_argument(
+        "[rms_norm_linear] linear_weight must be 2D.");
+  }
+
+  int in_features = x.shape(-1);
+  int weight_in_features =
+      weight_transposed ? linear_weight.shape(0) : linear_weight.shape(1);
+  if (weight_in_features != in_features) {
+    std::ostringstream msg;
+    msg << "[rms_norm_linear] linear_weight input dimension must match x.shape(-1). "
+        << "Got x.shape(-1)=" << in_features << " and linear_weight input dimension="
+        << weight_in_features << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  int out_features =
+      weight_transposed ? linear_weight.shape(1) : linear_weight.shape(0);
+
+  if (has_norm_weight) {
+    if ((*norm_weight).ndim() != 1 || (*norm_weight).shape(0) != in_features) {
+      throw std::invalid_argument(
+          "[rms_norm_linear] norm_weight must be 1D with size equal to x.shape(-1).");
+    }
+  }
+  if (has_bias) {
+    if ((*bias).ndim() != 1 || (*bias).shape(0) != out_features) {
+      throw std::invalid_argument(
+          "[rms_norm_linear] bias must be 1D with size equal to linear_weight.shape(0).");
+    }
+  }
+
+  std::vector<array> type_inputs{x, linear_weight};
+  if (has_norm_weight) {
+    type_inputs.push_back(*norm_weight);
+  }
+  if (has_bias) {
+    type_inputs.push_back(*bias);
+  }
+  auto out_type = result_type(type_inputs);
+  if (!issubdtype(out_type, floating)) {
+    std::ostringstream msg;
+    msg << "[rms_norm_linear] Received unsupported type " << out_type << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto s = to_stream(s_);
+  int rows = x.size() / in_features;
+  Shape flat_x_shape{rows, in_features};
+  Shape flat_out_shape{rows, out_features};
+  Shape out_shape = x.shape();
+  out_shape.back() = out_features;
+
+  auto fallback =
+      [has_norm_weight, has_bias, eps, s, weight_transposed](
+          const std::vector<array>& inputs) {
+        auto x_norm = rms_norm(
+            inputs[0],
+            has_norm_weight ? std::optional<array>(inputs[1]) : std::nullopt,
+            eps,
+            s);
+        auto weight = weight_transposed ? inputs[2] : transpose(inputs[2], {1, 0}, s);
+        auto flat_out = has_bias
+            ? addmm(inputs[3], x_norm, weight, 1.0f, 1.0f, s)
+            : matmul(x_norm, weight, s);
+        return std::vector<array>{flat_out};
+      };
+
+  auto flat_x = astype(reshape(x, flat_x_shape, s), out_type, s);
+  auto passed_norm_weight =
+      has_norm_weight ? astype(*norm_weight, out_type, s) : array(1, out_type);
+  auto passed_linear_weight = astype(linear_weight, out_type, s);
+  auto passed_bias = has_bias ? astype(*bias, out_type, s) : array(0, out_type);
+
+  return reshape(
+      fallback({flat_x, passed_norm_weight, passed_linear_weight, passed_bias})[0],
+      out_shape,
+      s);
 }
 
 array layer_norm(
@@ -379,6 +503,13 @@ std::vector<array> LayerNorm::vjp(
   }
 
   return returned_vjps;
+}
+
+bool RMSNormLinear::is_equivalent(const Primitive& other) const {
+  const RMSNormLinear& a_other = static_cast<const RMSNormLinear&>(other);
+  return eps_ == a_other.eps_ &&
+      has_norm_weight_ == a_other.has_norm_weight_ &&
+      has_bias_ == a_other.has_bias_;
 }
 
 bool LayerNorm::is_equivalent(const Primitive& other) const {

@@ -16,6 +16,19 @@ MLX_API array rms_norm(
     float eps,
     StreamOrDevice s = {});
 
+MLX_API array relu2(
+    const array& x,
+    StreamOrDevice s = {});
+
+MLX_API array rms_norm_linear(
+    const array& x,
+    const std::optional<array>& norm_weight,
+    const array& linear_weight,
+    const std::optional<array>& bias,
+    float eps,
+    bool weight_transposed = false,
+    StreamOrDevice s = {});
+
 MLX_API array layer_norm(
     const array& x,
     const std::optional<array>& weight,

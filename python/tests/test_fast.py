@@ -54,6 +54,10 @@ def rms_norm(x, weight, eps):
     return weight * x.astype(weight.dtype)
 
 
+def relu2(x):
+    return mx.square(mx.maximum(x, 0))
+
+
 def layer_norm(x, weight, bias, eps):
     ot = x.dtype
     x = x.astype(mx.float32)
@@ -66,6 +70,20 @@ def layer_norm(x, weight, bias, eps):
     if bias is not None:
         x = x + bias
     return x
+
+
+def rms_norm_linear(x, norm_weight, linear_weight, bias, eps, weight_transposed=False):
+    x_norm = rms_norm(
+        x,
+        norm_weight if norm_weight is not None else mx.ones((x.shape[-1],), dtype=x.dtype),
+        eps,
+    )
+    weight = linear_weight if weight_transposed else linear_weight.T
+    out = mx.matmul(x_norm.reshape((-1, x.shape[-1])), weight)
+    if bias is not None:
+        out = out + bias
+    out_features = linear_weight.shape[1] if weight_transposed else linear_weight.shape[0]
+    return out.reshape((*x.shape[:-1], out_features))
 
 
 class TestFast(mlx_tests.MLXTestCase):
@@ -409,6 +427,105 @@ class TestFast(mlx_tests.MLXTestCase):
         with self.assertRaises(ValueError):
             x = mx.random.uniform(shape=(1, 5))
             mx.fast.rms_norm(x, mx.ones((4,)), 1e-5)
+
+    def test_relu2(self):
+        tolerances = {mx.float32: 1e-6, mx.float16: 2e-3, mx.bfloat16: 1e-2}
+        for dtype in [mx.float32, mx.float16, mx.bfloat16]:
+            x = mx.random.normal(shape=(2, 3, 16)).astype(dtype)
+            ref = relu2(x)
+            fused = mx.fast.relu2(x)
+            self.assertLess(mx.abs(ref - fused).max(), tolerances[dtype])
+
+        with self.assertRaises(ValueError):
+            x = mx.array([1, -2, 3], dtype=mx.int32)
+            mx.fast.relu2(x)
+
+    def test_relu2_grad(self):
+        x = mx.random.normal(shape=(2, 4, 8))
+        y = mx.random.normal(shape=(2, 4, 8))
+        f_ref = lambda x, y: (relu2(x) * y).sum()
+        f_fast = lambda x, y: (mx.fast.relu2(x) * y).sum()
+        gx_ref = mx.grad(f_ref, argnums=0)(x, y)
+        gx_fast = mx.grad(f_fast, argnums=0)(x, y)
+        self.assertTrue(mx.allclose(gx_ref, gx_fast, atol=1e-5, rtol=1e-5))
+
+    def test_rms_norm_linear(self):
+        eps = 1e-5
+        tolerances = {mx.float32: 1e-5, mx.float16: 2e-2, mx.bfloat16: 7e-2}
+
+        for dtype in [mx.float32, mx.float16, mx.bfloat16]:
+            x = mx.random.normal(shape=(2, 3, 16)).astype(dtype)
+            norm_weight = mx.random.normal(shape=(16,)).astype(dtype)
+            linear_weight = mx.random.normal(shape=(24, 16)).astype(dtype)
+            bias = mx.random.normal(shape=(24,)).astype(dtype)
+
+            for maybe_norm_weight in [norm_weight, None]:
+                for maybe_bias in [bias, None]:
+                    ref = rms_norm_linear(
+                        x, maybe_norm_weight, linear_weight, maybe_bias, eps
+                    )
+                    fused = mx.fast.rms_norm_linear(
+                        x, maybe_norm_weight, linear_weight, maybe_bias, eps
+                    )
+                    self.assertLess(mx.abs(ref - fused).max(), tolerances[dtype])
+
+                    linear_weight_t = linear_weight.T
+                    ref_t = rms_norm_linear(
+                        x,
+                        maybe_norm_weight,
+                        linear_weight_t,
+                        maybe_bias,
+                        eps,
+                        weight_transposed=True,
+                    )
+                    fused_t = mx.fast.rms_norm_linear(
+                        x,
+                        maybe_norm_weight,
+                        linear_weight_t,
+                        maybe_bias,
+                        eps,
+                        True,
+                    )
+                    self.assertLess(mx.abs(ref_t - fused_t).max(), tolerances[dtype])
+
+    def test_rms_norm_linear_grad(self):
+        eps = 1e-5
+        x = mx.random.normal(shape=(2, 4, 8))
+        norm_weight = mx.random.normal(shape=(8,))
+        linear_weight = mx.random.normal(shape=(12, 8))
+        bias = mx.random.normal(shape=(12,))
+        y = mx.random.normal(shape=(2, 4, 12))
+
+        f_ref = lambda x, nw, lw, b, y: (rms_norm_linear(x, nw, lw, b, eps) * y).sum()
+        f_fast = lambda x, nw, lw, b, y: (
+            mx.fast.rms_norm_linear(x, nw, lw, b, eps) * y
+        ).sum()
+
+        grads_ref = mx.grad(f_ref, argnums=(0, 1, 2, 3))(x, norm_weight, linear_weight, bias, y)
+        grads_fast = mx.grad(f_fast, argnums=(0, 1, 2, 3))(x, norm_weight, linear_weight, bias, y)
+        for g_ref, g_fast in zip(grads_ref, grads_fast):
+            self.assertTrue(mx.allclose(g_ref, g_fast, atol=1e-5, rtol=1e-5))
+
+        linear_weight_t = linear_weight.T
+        f_ref_t = lambda x, nw, lwt, b, y: (
+            rms_norm_linear(x, nw, lwt, b, eps, weight_transposed=True) * y
+        ).sum()
+        f_fast_t = lambda x, nw, lwt, b, y: (
+            mx.fast.rms_norm_linear(x, nw, lwt, b, eps, True) * y
+        ).sum()
+        grads_ref = mx.grad(f_ref_t, argnums=(0, 1, 2, 3))(x, norm_weight, linear_weight_t, bias, y)
+        grads_fast = mx.grad(f_fast_t, argnums=(0, 1, 2, 3))(x, norm_weight, linear_weight_t, bias, y)
+        for g_ref, g_fast in zip(grads_ref, grads_fast):
+            self.assertTrue(mx.allclose(g_ref, g_fast, atol=1e-5, rtol=1e-5))
+
+        f_ref_noparams = lambda x, lw, y: (rms_norm_linear(x, None, lw, None, eps) * y).sum()
+        f_fast_noparams = lambda x, lw, y: (
+            mx.fast.rms_norm_linear(x, None, lw, None, eps) * y
+        ).sum()
+        grads_ref = mx.grad(f_ref_noparams, argnums=(0, 1))(x, linear_weight, y)
+        grads_fast = mx.grad(f_fast_noparams, argnums=(0, 1))(x, linear_weight, y)
+        for g_ref, g_fast in zip(grads_ref, grads_fast):
+            self.assertTrue(mx.allclose(g_ref, g_fast, atol=1e-5, rtol=1e-5))
 
     def test_rms_norm_grad(self):
         D = 32

@@ -108,6 +108,59 @@ void init_fast(nb::module_& parent_module) {
       )pbdoc");
 
   m.def(
+      "relu2",
+      &mx::fast::relu2,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def relu2(x: array, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Compute the squared ReLU activation ``max(x, 0)^2`` in a single call.
+
+        Args:
+            x (array): Input floating-point array.
+
+        Returns:
+            array: The activated array.
+      )pbdoc");
+
+  m.def(
+      "rms_norm_linear",
+      &mx::fast::rms_norm_linear,
+      "x"_a,
+      "norm_weight"_a.none(),
+      "linear_weight"_a,
+      "bias"_a.none(),
+      "eps"_a,
+      "weight_transposed"_a = false,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def rms_norm_linear(x: array, norm_weight: Optional[array], linear_weight: array, bias: Optional[array], eps: float, weight_transposed: bool = False, *, stream: Union[None, Stream, Device] = None) -> array"),
+      R"pbdoc(
+        Fused RMSNorm followed by a linear projection.
+
+        The normalization is with respect to the last axis of ``x`` and the
+        linear projection uses ``linear_weight`` with shape
+        ``[out_features, in_features]`` by default, or
+        ``[in_features, out_features]`` when ``weight_transposed=True``.
+
+        Args:
+            x (array): Input array with the last dimension equal to ``in_features``.
+            norm_weight (array, optional): Optional RMSNorm scale of shape ``[in_features]``.
+            linear_weight (array): Linear projection weights of shape
+              ``[out_features, in_features]`` by default.
+            bias (array, optional): Optional projection bias of shape ``[out_features]``.
+            eps (float): A small additive constant for numerical stability.
+            weight_transposed (bool): Whether ``linear_weight`` is already laid out as
+              ``[in_features, out_features]``.
+
+        Returns:
+            array: The projected output with the same leading dimensions as ``x``.
+      )pbdoc");
+
+  m.def(
       "layer_norm",
       &mx::fast::layer_norm,
       "x"_a,

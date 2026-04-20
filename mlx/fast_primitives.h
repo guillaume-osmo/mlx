@@ -36,6 +36,28 @@ class Custom : public Primitive {
   std::function<std::vector<array>(std::vector<array>)> fallback_;
 };
 
+class ReluSquared : public Custom {
+ public:
+  ReluSquared(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback)
+      : Custom(stream, std::move(fallback)) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    outputs = fallback_(inputs);
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(ReluSquared)
+  bool is_equivalent(const Primitive& other) const override;
+  DEFINE_INPUT_OUTPUT_SHAPE()
+  auto state() const {
+    return std::make_tuple(nullptr);
+  }
+};
+
 class RMSNorm : public Custom {
  public:
   RMSNorm(
@@ -94,6 +116,41 @@ class RMSNormVJP : public Custom {
 
  private:
   float eps_;
+};
+
+class RMSNormLinear : public Custom {
+ public:
+  RMSNormLinear(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      float eps,
+      bool has_norm_weight,
+      bool has_bias)
+      : Custom(stream, std::move(fallback)),
+        eps_(eps),
+        has_norm_weight_(has_norm_weight),
+        has_bias_(has_bias) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override {
+    outputs = fallback_(inputs);
+  }
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(RMSNormLinear)
+  bool is_equivalent(const Primitive& other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    return {{inputs[0].shape(0), inputs[2].shape(0)}};
+  }
+  auto state() const {
+    return std::make_tuple(nullptr, eps_, has_norm_weight_, has_bias_);
+  }
+
+ private:
+  float eps_;
+  bool has_norm_weight_;
+  bool has_bias_;
 };
 
 class LayerNorm : public Custom {
